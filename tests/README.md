@@ -46,3 +46,10 @@ of uncalled files, multiple releases in the same TXT, unreadable masters, and
 the absence of call traces/CSV files by default. Extra or repeated master targets
 do not change a complete file-coverage result in simple mode. Detailed-report
 checks explicitly pass `-DetailedReport` and retain their original expectations.
+
+Security cases cover Unicode filename collisions, master/source identity, CSV
+formula prefixes and quote/separator payloads, terminal escape and direction
+controls, invalid-input result-line spoofing, report overwrite/hardlink prevention,
+short-name report destinations, reserved devices before/after path normalization
+and alternate streams, explicit size limits, and all five
+supported Unicode BOMs. Fixture paths and hashes must remain unchanged.

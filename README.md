@@ -74,6 +74,23 @@ Use `-ScriptEncoding Default` for legacy Windows ANSI scripts; the default is
 strict UTF-8, with Unicode BOM detection. `-NoPause` disables the final wait when
 running the PowerShell script interactively. `-Help` lists parameters.
 
+## Security and limits
+
+The checker treats release scripts as data. It never evaluates variables or runs
+their commands. Report locations are checked against Windows filesystem paths,
+including short-name aliases, and checked again before each write. Reports use
+fresh folders and refuse to overwrite existing files or hardlinks.
+
+Terminal controls and invisible direction markers are shown as `\uXXXX` escapes.
+Formula-like values in detailed CSVs receive a visible `text:` prefix; downstream
+CSV consumers must account for that prefix. Source files remain unchanged.
+
+Each parsed script is limited to 64 MB by default. Use `-MaxScriptSizeMB 128` for
+larger legitimate scripts. Exceeding the limit produces an incomplete result.
+Detailed reports include source lines and arguments: keep them in a folder you
+control. See [SECURITY-AUDIT.md](SECURITY-AUDIT.md) for the review and remaining
+limitations, including concurrent filesystem changes and large directory trees.
+
 Default exit codes: `0` all checked files have matching master calls; `1` some
 files have no matching call; `2` the check is incomplete or failed. The highest
 code wins for multiple releases. In detailed mode, extra/missing targets,

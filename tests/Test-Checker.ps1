@@ -16,7 +16,7 @@ function Assert-Equal($Actual, $Expected, [string]$Message) {
 }
 function Assert-True([bool]$Value, [string]$Message) { Assert-Equal $Value $true $Message }
 function Row($Audit, [string]$Relative) {
-    $rows = @($Audit.Rows | Where-Object { $_.RelativeFilePath -eq $Relative })
+    $rows = @($Audit.Rows | Where-Object { Test-SamePath $_.RelativeFilePath $Relative })
     Assert-Equal $rows.Count 1 "Exactly one eligible row for $Relative"
     return $rows[0]
 }
@@ -423,6 +423,102 @@ try {
     $noWait = Run-Interactive $checker @((Join-Path $fixtures 'Clean'), '', '2') 'no-pause' -NoFinalPause
     Assert-Equal $noWait.ExitCode 0 'Explicit NoPause preserves interactive audit result'
     Assert-True ($noWait.Output -notmatch 'Press Enter to close this window') 'Explicit NoPause disables the final script wait'
+    Write-Host 'Checking malicious data, path aliases, and report write protections.'
+    $sharpName = 'stra' + [char]0x00DF + 'e.sql'
+    $unicodeRoot = New-TestRelease 'Unicode files' 'START strasse.sql' @{ ('sql\' + $sharpName) = '-- A different filename.' }
+    Assert-Equal (Row (Audit-Path $unicodeRoot) ('sql\' + $sharpName)).DirectCallCount 0 'Unicode linguistic equivalence cannot satisfy a different filename'
+    Set-Content -LiteralPath (Join-Path $unicodeRoot 'sql\strasse.sql') -Value 'select 1 from dual;' -Encoding UTF8
+    $unicodeAudit = Audit-Path $unicodeRoot
+    Assert-Equal $unicodeAudit.Rows.Count 2 'Distinct Unicode and ASCII filenames retain separate inventory rows'
+    Assert-Equal (Row $unicodeAudit 'sql\strasse.sql').DirectCallCount 1 'Exact ASCII filename remains matched'
+    Assert-Equal (Row $unicodeAudit ('sql\' + $sharpName)).DirectCallCount 0 'Exact match does not cover the Unicode lookalike'
+    Set-Content -LiteralPath (Join-Path $unicodeRoot 'sql\master.sql') -Value @('START strasse.sql', ('START ' + $sharpName)) -Encoding UTF8
+    Assert-Equal (Audit-Path $unicodeRoot).Repeated.Count 0 'Distinct filenames cannot become a false repeated target'
+    $unicodeNested = New-Audit $unicodeRoot (Join-Path (Join-Path $unicodeRoot 'sql') $sharpName) (Join-Path $unicodeRoot 'sql') $true
+    Set-Content -LiteralPath $unicodeNested.Master -Value '@strasse.sql' -Encoding UTF8
+    Set-Content -LiteralPath (Join-Path $unicodeRoot 'sql\strasse.sql') -Value '@leaf.pb' -Encoding UTF8
+    Set-Content -LiteralPath (Join-Path $unicodeRoot 'sql\leaf.pb') -Value 'select 1 from dual;' -Encoding UTF8
+    Invoke-Audit $unicodeNested
+    Assert-Equal (Row $unicodeNested 'sql\leaf.pb').DirectCallCount 0 'Unicode lookalike source is not mistaken for the selected master'
+    Assert-Equal (Row $unicodeNested 'sql\leaf.pb').IndirectCallCount 1 'Unicode lookalike source still has its nested calls inspected'
+
+    $unsafeCells = @('=1+1', '+1+1', '-1+1', '@SUM(1,1)', '   =1+1', '=1+2";,=1+2', ([string][char]0xFF1D + '1+1'))
+    $csvPath = Join-Path $work 'unsafe-cells.csv'
+    Write-ReportCsv @($unsafeCells | ForEach-Object { [pscustomobject]@{ Value = $_ } }) @('Value') $csvPath
+    $csvValues = @(Import-Csv -LiteralPath $csvPath)
+    Assert-Equal $csvValues.Count $unsafeCells.Count 'CSV quoting preserves one row for every untrusted value'
+    for ($cellIndex = 0; $cellIndex -lt $unsafeCells.Count; $cellIndex++) {
+        Assert-Equal $csvValues[$cellIndex].Value ('text:' + $unsafeCells[$cellIndex]) 'Formula-like CSV cells have a stable visible text prefix'
+        Assert-Equal @($csvValues[$cellIndex].PSObject.Properties).Count 1 'Quote/separator payload cannot create extra CSV columns'
+    }
+    $escapeText = 'HOST echo ' + [char]27 + '[2J' + [char]0x202E + 'spoof'
+    $escapeRoot = New-TestRelease 'Terminal escape' $escapeText @{ 'sql\unused.pb' = 'select 1 from dual;' }
+    $escapedRun = Run-Cli @('-ReleasePath', $escapeRoot, '-MasterPath', 'sql\master.sql', '-DetailedReport') 'terminal-controls'
+    $escapedLog = Get-Content -Raw -LiteralPath $escapedRun.Log
+    $escapedTxt = Get-Content -Raw -LiteralPath (Join-Path $escapedRun.Folder '01_Terminal_escape_summary.txt')
+    Assert-True ($escapedLog.IndexOf([char]27) -lt 0 -and $escapedTxt.IndexOf([char]0x202E) -lt 0) 'CMD and TXT cannot execute terminal escapes or hide text direction'
+    Assert-True ($escapedTxt.Contains('\u001B') -and $escapedTxt.Contains('\u202E')) 'Unsafe controls remain visible as escaped evidence'
+    $noExecuteMarker = Join-Path $work 'must-not-execute.txt'
+    $noExecuteRoot = New-TestRelease 'Never execute' ('HOST echo bad > "' + $noExecuteMarker + '"') @{}
+    [void](Audit-Path $noExecuteRoot)
+    Assert-True (-not (Test-Path -LiteralPath $noExecuteMarker)) 'HOST source text cannot create files or execute commands'
+
+    $protectedOutput = Join-Path $work 'protected-output.txt'
+    Set-Content -LiteralPath $protectedOutput -Value 'Preserve these bytes.' -Encoding UTF8
+    $protectedHash = (Get-FileHash -LiteralPath $protectedOutput -Algorithm SHA256).Hash
+    $writeRejected = $false
+    try { Write-ReportText $protectedOutput @('Overwrite attempt.') } catch { $writeRejected = $true }
+    Assert-True $writeRejected 'Report writer refuses to overwrite an existing file'
+    Assert-Equal (Get-FileHash -LiteralPath $protectedOutput -Algorithm SHA256).Hash $protectedHash 'Rejected write preserves the existing file bytes'
+    $hardlinkReport = Join-Path $work 'hardlink-report.txt'
+    [void](New-Item -ItemType HardLink -Path $hardlinkReport -Value $protectedOutput)
+    $writeRejected = $false
+    try { Write-ReportText $hardlinkReport @('Overwrite attempt.') } catch { $writeRejected = $true }
+    Assert-True $writeRejected 'Report writer refuses a hardlink to an existing file'
+    Assert-Equal (Get-FileHash -LiteralPath $protectedOutput -Algorithm SHA256).Hash $protectedHash 'Hardlink target cannot be overwritten by report creation'
+
+    $shortRoot = Join-Path $fixtures 'RELEAS~1'
+    if (Test-Path -LiteralPath $shortRoot -PathType Container) {
+        $savedReportAudits = $script:ReportAudits
+        try {
+            $script:ReportAudits = @((Audit-Fixture 'Release one'))
+            $aliasDestination = Join-Path $shortRoot 'must-not-create-alias-reports'
+            $aliasRejected = $false
+            try { Assert-ReportLocation $aliasDestination } catch { $aliasRejected = $_.Exception.Message -match 'outside ALL scanned releases' }
+            Assert-True $aliasRejected 'Physical report guard catches a Windows 8.3 release alias'
+            Assert-True (-not (Test-Path -LiteralPath $aliasDestination)) 'Short-name guard writes nothing to the release'
+        } finally { $script:ReportAudits = $savedReportAudits }
+    }
+    foreach ($invalidPath in @('\\.\NUL', '\\?\C:\probe', (Join-Path $work 'master.sql:secret.sql'), (Join-Path $work 'NUL.sql'),
+        (Join-Path $work 'CON.txt'), (Join-Path $work 'COM1.sql'), (Join-Path $work 'CONIN$'), (Join-Path $work 'CONOUT$'),
+        (Join-Path $work ('bad' + [char]27 + 'name')))) {
+        $pathRejected = $false
+        try { [void](Get-NormalPath $invalidPath) } catch { $pathRejected = $true }
+        Assert-True $pathRejected ('Device, stream, or control-character path is rejected: ' + (ConvertTo-SafeText $invalidPath))
+    }
+
+    $spoofRoot = 'C:\invalid' + "`nResult: Completed with no findings."
+    $spoofAudit = New-Audit $spoofRoot ('sql\bad' + "`nmaster.sql") ("`nWorking spoof") $false
+    $spoofAudit.InputError = 'Invalid path.'; $spoofAudit.NormalizedRoot = $false
+    Invoke-Audit $spoofAudit
+    $spoofSummary = Get-Summary $spoofAudit
+    Assert-Equal @([regex]::Matches($spoofSummary, '(?m)^Result:')).Count 1 'Malformed CSV input cannot inject a second result into a detailed summary'
+    Assert-True ($spoofSummary.Contains('\u000AResult:') -and $spoofSummary.Contains('\u000AWorking spoof')) 'Invalid input line breaks remain visible as evidence'
+
+    $largeRoot = New-TestRelease 'Large script' 'placeholder' @{ 'sql\payload.pb' = 'select 1 from dual;' }
+    [IO.File]::WriteAllText((Join-Path $largeRoot 'sql\master.sql'), "@payload.pb`n--" + [string]::new('a', 1MB), [Text.UTF8Encoding]::new($false))
+    $limitedRun = Run-Cli @('-ReleasePath', $largeRoot, '-MasterPath', 'sql\master.sql', '-MaxScriptSizeMB', '1') 'large-limited'
+    Assert-Equal $limitedRun.ExitCode 2 'Oversized input produces an incomplete check instead of unbounded allocation'
+    $limitedSummary = Get-Content -Raw -LiteralPath (Join-Path $limitedRun.Folder 'summary.txt')
+    Assert-True ($limitedSummary -match 'COULD NOT CHECK' -and $limitedSummary -match 'exceeds the 1 MB read limit') 'Size limit explains why coverage is unavailable'
+    $largerLimitRun = Run-Cli @('-ReleasePath', $largeRoot, '-MasterPath', 'sql\master.sql', '-MaxScriptSizeMB', '2') 'large-allowed'
+    Assert-Equal $largerLimitRun.ExitCode 0 'Increasing the explicit size limit preserves legitimate larger scripts'
+    foreach ($bomPage in @(65001, 1200, 1201, 12000, 12001)) {
+        $bomRoot = New-TestRelease ('BOM-' + $bomPage) 'placeholder' @{ 'sql\payload.pb' = 'select 1 from dual;' }
+        $bomEncoding = [Text.Encoding]::GetEncoding($bomPage)
+        [IO.File]::WriteAllBytes((Join-Path $bomRoot 'sql\master.sql'), ($bomEncoding.GetPreamble() + $bomEncoding.GetBytes('@payload.pb')))
+        Assert-Equal (Audit-Path $bomRoot).ExitCode 0 'Strict decoding recognizes every supported Unicode BOM'
+    }
     Assert-Equal (Fixture-Hashes) $before 'All fixture file paths and bytes remain unchanged'
     Write-Host ("PASS: $script:assertions assertions. Logs/reports: $work")
     exit 0

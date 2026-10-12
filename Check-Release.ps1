@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
 .SYNOPSIS
 Release Script Checker: read-only static SQL*Plus reference auditing.
@@ -19,6 +19,7 @@ param(
     [string]$InputCsv,
     [ValidateSet('UTF8', 'Default', 'Unicode', 'BigEndianUnicode')]
     [string]$ScriptEncoding = 'UTF8',
+    [ValidateRange(1, 1024)][int]$MaxScriptSizeMB = 64,
     [switch]$NonInteractive,
     [switch]$NoPause,
     [switch]$Help
@@ -28,16 +29,103 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 $script:ExcludedExtensions = @('.ear', '.java', '.war', '.bc', '.zip',
     '.docx', '.wft', '.perl', '.pl', '.txt', '.cmd', '.sh', '.bat', '.undeploy')
+$script:ReportAudits = @()
+
+function New-PathMap { return [Collections.Hashtable]::new([StringComparer]::OrdinalIgnoreCase) }
+function Test-SamePath([string]$Left, [string]$Right) { return [string]::Equals($Left, $Right, [StringComparison]::OrdinalIgnoreCase) }
+
+function ConvertTo-SafeText([string]$Text, [switch]$Multiline) {
+    $pattern = if ($Multiline) { '[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F\p{Cf}\u2028\u2029]' } else { '[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]' }
+    return [regex]::Replace($Text, $pattern, { param($m) '\u{0:X4}' -f [int]$m.Value[0] })
+}
+function Write-Console([string]$Message) { Write-Host (ConvertTo-SafeText $Message -Multiline) }
+
+function Get-PhysicalPath([string]$Path) {
+    if (-not ('ReleaseChecker.NativePaths' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System; using System.Text; using System.Runtime.InteropServices; using Microsoft.Win32.SafeHandles;
+namespace ReleaseChecker {
+    public static class NativePaths {
+        [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+        static extern SafeFileHandle CreateFile(string path, uint access, uint share, IntPtr security, uint mode, uint flags, IntPtr template);
+        [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+        static extern uint GetFinalPathNameByHandle(SafeFileHandle handle, StringBuilder path, uint size, uint flags);
+        public static string Resolve(string path) {
+            using (var handle = CreateFile(path, 0, 7, IntPtr.Zero, 3, 0x02000000, IntPtr.Zero)) {
+                if (handle.IsInvalid) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+                var result = new StringBuilder(32768);
+                uint size = GetFinalPathNameByHandle(handle, result, (uint)result.Capacity, 2);
+                if (size == 0 || size >= result.Capacity) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+                return result.ToString();
+            }
+        }
+    }
+}
+'@
+    }
+    $cursor = $Path; $suffix = ''
+    while (-not (Test-Path -LiteralPath $cursor)) {
+        $suffix = '\' + [IO.Path]::GetFileName($cursor) + $suffix
+        $cursor = [IO.Path]::GetDirectoryName($cursor.TrimEnd('\'))
+        if (-not $cursor) { throw "Cannot determine the filesystem location: $Path" }
+    }
+    return [ReleaseChecker.NativePaths]::Resolve($cursor).TrimEnd('\') + $suffix
+}
+
+function Test-LocationInRoot([string]$Path, [string]$Root) {
+    return ((Test-InRoot $Path $Root) -or ((Test-Path -LiteralPath $Root -PathType Container) -and
+        (Test-InRoot (Get-PhysicalPath $Path) (Get-PhysicalPath $Root))))
+}
+
+function Assert-ReportLocation([string]$Path) {
+    foreach ($audit in $script:ReportAudits) {
+        if ($audit.NormalizedRoot -and (Test-LocationInRoot $Path $audit.Root)) { throw "ReportDirectory must be outside ALL scanned releases: $($audit.Root)" }
+    }
+    Assert-NoPathLinks $Path
+}
+
+function Write-ReportText([string]$Path, [string[]]$Lines) {
+    Assert-ReportLocation $Path
+    $stream = [IO.File]::Open($Path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    $writer = $null
+    try {
+        $writer = [IO.StreamWriter]::new($stream, [Text.UTF8Encoding]::new($true))
+        foreach ($line in $Lines) { $writer.WriteLine((ConvertTo-SafeText $line -Multiline)) }
+    } finally { if ($writer) { $writer.Dispose() } else { $stream.Dispose() } }
+}
+
+function Read-ScriptBytes([string]$Path) {
+    Assert-NoPathLinks $Path
+    $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    try {
+        if ($stream.Length -gt $MaxScriptSizeMB * 1MB) { throw "Script exceeds the $MaxScriptSizeMB MB read limit; use -MaxScriptSizeMB to increase it." }
+        $bytes = New-Object byte[] ([int]$stream.Length)
+        $offset = 0
+        while ($offset -lt $bytes.Length) {
+            $read = $stream.Read($bytes, $offset, $bytes.Length - $offset)
+            if (-not $read) { throw 'Script changed or ended unexpectedly while reading.' }
+            $offset += $read
+        }
+        return ,$bytes
+    } finally { $stream.Dispose() }
+}
 
 function Get-NormalPath([string]$Path, [string]$Base = (Get-Location).ProviderPath) {
     if ([string]::IsNullOrWhiteSpace($Path)) { throw 'An empty path is not valid.' }
     $p = $Path.Trim().Trim('"').Replace('/', '\')
+    if ($p -match '^\\\\[?.]\\|^\\\?\?\\|[\x00-\x1F]') { throw 'Device namespaces and control characters are not supported in paths.' }
     if ($p -match '^[A-Za-z]:[^\\]' -or $p -match '^[A-Za-z]:$') {
         throw "Drive-relative paths are not supported: $p. Use a full path."
     }
     if (-not [IO.Path]::IsPathRooted($p)) { $p = [IO.Path]::Combine($Base, $p) }
     $p = [IO.Path]::GetFullPath($p)
+    # .NET Framework can turn NUL.sql and similar DOS names into device paths.
+    if ($p -match '^\\\\[?.]\\|^\\\?\?\\') { throw 'Reserved Windows device names and namespaces are not supported in paths.' }
     $root = [IO.Path]::GetPathRoot($p)
+    if (($p -replace '^[A-Za-z]:', '') -match ':') { throw 'Alternate data streams are not supported in paths.' }
+    foreach ($part in ($p.Substring($root.Length) -split '\\')) {
+        if ($part.TrimEnd(' ', '.') -match '^(?i:CON|PRN|AUX|NUL|CONIN\$|CONOUT\$|CLOCK\$|COM[1-9\u00B9\u00B2\u00B3]|LPT[1-9\u00B9\u00B2\u00B3])(?:\.|$)') { throw 'Reserved Windows device names are not supported in paths.' }
+    }
     if ($p.Length -gt $root.Length) { $p = $p.TrimEnd('\') }
     return $p
 }
@@ -211,29 +299,16 @@ function Read-Script([string]$Path) {
     try {
         # Decode the complete byte array: .NET Framework StreamReader can drop
         # an incomplete UTF-8 sequence at EOF without flushing its decoder.
-        $bytes = [IO.File]::ReadAllBytes($Path)
-        $encoding = switch ($ScriptEncoding) {
-            'Default' {
-                $ansi = [Text.Encoding]::Default.Clone()
-                $ansi.DecoderFallback = New-Object Text.DecoderExceptionFallback
-                $ansi
-            }
-            'Unicode' { New-Object Text.UnicodeEncoding($false, $false, $true) }
-            'BigEndianUnicode' { New-Object Text.UnicodeEncoding($true, $false, $true) }
-            default { New-Object Text.UTF8Encoding($false, $true) }
-        }
+        $bytes = Read-ScriptBytes $Path
+        $codePage = @{ UTF8 = 65001; Default = [Text.Encoding]::Default.CodePage; Unicode = 1200; BigEndianUnicode = 1201 }[$ScriptEncoding]
         $offset = 0
-        if ($bytes.Length -ge 4 -and $bytes[0] -eq 255 -and $bytes[1] -eq 254 -and $bytes[2] -eq 0 -and $bytes[3] -eq 0) {
-            $encoding = New-Object Text.UTF32Encoding($false, $true, $true); $offset = 4
-        } elseif ($bytes.Length -ge 4 -and $bytes[0] -eq 0 -and $bytes[1] -eq 0 -and $bytes[2] -eq 254 -and $bytes[3] -eq 255) {
-            $encoding = New-Object Text.UTF32Encoding($true, $true, $true); $offset = 4
-        } elseif ($bytes.Length -ge 3 -and $bytes[0] -eq 239 -and $bytes[1] -eq 187 -and $bytes[2] -eq 191) {
-            $encoding = New-Object Text.UTF8Encoding($false, $true); $offset = 3
-        } elseif ($bytes.Length -ge 2 -and $bytes[0] -eq 255 -and $bytes[1] -eq 254) {
-            $encoding = New-Object Text.UnicodeEncoding($false, $true, $true); $offset = 2
-        } elseif ($bytes.Length -ge 2 -and $bytes[0] -eq 254 -and $bytes[1] -eq 255) {
-            $encoding = New-Object Text.UnicodeEncoding($true, $true, $true); $offset = 2
+        foreach ($bom in @(@('FF-FE-00-00', 12000, 4), @('00-00-FE-FF', 12001, 4),
+            @('EF-BB-BF', 65001, 3), @('FF-FE', 1200, 2), @('FE-FF', 1201, 2))) {
+            if ($bytes.Length -ge $bom[2] -and [BitConverter]::ToString($bytes, 0, $bom[2]) -eq $bom[0]) {
+                $codePage = $bom[1]; $offset = $bom[2]; break
+            }
         }
+        $encoding = [Text.Encoding]::GetEncoding($codePage, [Text.EncoderFallback]::ExceptionFallback, [Text.DecoderFallback]::ExceptionFallback)
         $text = $encoding.GetString($bytes, $offset, $bytes.Length - $offset)
         if ($text.IndexOf([char]0) -ge 0) { throw 'Binary/NUL content is not a supported SQL*Plus text script.' }
         $lines = [regex]::Split($text, '\r\n|\n|\r')
@@ -379,10 +454,10 @@ function Visit-Script($Audit, [string]$Path, [string[]]$Stack, [string]$Chain) {
     $stackNow = @($Stack) + @($Path)
     foreach ($call in $parsed.Calls) {
         $edgeChain = $Chain + ':' + $call.LineNumber + ' -> ' + $call.Target
-        $reference = Resolve-Call $call $Audit $edgeChain ($Path -eq $Audit.Master)
+        $reference = Resolve-Call $call $Audit $edgeChain (Test-SamePath $Path $Audit.Master)
         [void]$Audit.References.Add($reference)
         if ($Audit.Nested -and $reference.Status -eq 'Resolved') {
-            if ($stackNow -contains $reference.ResolvedPath) {
+            if (@($stackNow | Where-Object { Test-SamePath $_ $reference.ResolvedPath }).Count) {
                 $reference.Cycle = $true; $reference.Notes += ' Cycle detected; traversal stopped at this edge.'
             } else {
                 # SQL*Plus can read any extension. Recognize foreign languages
@@ -401,11 +476,11 @@ function New-Audit([string]$Root, [string]$Master, [string]$Working, [bool]$Nest
     return [pscustomobject]@{
         Root = $Root; Master = $Master; WorkingDirectory = $Working; Nested = $Nested
         Encoding = $ScriptEncoding
-        Files = (New-Object System.Collections.ArrayList); ByPath = @{}; ByName = @{}
+        Files = (New-Object System.Collections.ArrayList); ByPath = (New-PathMap); ByName = (New-PathMap)
         References = (New-Object System.Collections.ArrayList); Issues = (New-Object System.Collections.ArrayList)
-        Rows = @(); Cache = @{}; Visited = @{}; ModelIssues = (New-Object System.Collections.ArrayList)
+        Rows = @(); Cache = (New-PathMap); Visited = (New-PathMap); ModelIssues = (New-Object System.Collections.ArrayList)
         SuffixUnknown = $false; SyntaxUnknown = $false; ModelChanged = $false
-        ExitCode = 2; Summary = ''; ReportPaths = @(); Repeated = @(); MasterReadable = $false
+        ExitCode = 2; Counts = @{}; Summary = ''; ReportPaths = @(); Repeated = @(); MasterReadable = $false
         InputError = ''; NormalizedRoot = $true
     }
 }
@@ -427,19 +502,19 @@ function Invoke-Audit($Audit) {
         # Settings changed by nested scripts persist in SQL*Plus. Rebuild the graph
         # conservatively when a reached setting invalidates default assumptions.
         do {
-            $Audit.ModelChanged = $false; $Audit.Visited = @{}
+            $Audit.ModelChanged = $false; $Audit.Visited = New-PathMap
             $Audit.References.Clear(); $Audit.Issues.Clear()
             foreach ($issue in $inventoryIssues) { [void]$Audit.Issues.Add($issue) }
             Visit-Script $Audit $Audit.Master @() (Get-RelativePath $Audit.Master $Audit.Root)
         } while ($Audit.ModelChanged)
         $Audit.MasterReadable = $Audit.Cache.ContainsKey($Audit.Master) -and $Audit.Cache[$Audit.Master].ReadSucceeded
         foreach ($issue in $Audit.ModelIssues) {
-            if (-not @($Audit.Issues | Where-Object { $_.SourceFile -eq $issue.SourceFile -and $_.LineNumber -eq $issue.LineNumber -and $_.Message -eq $issue.Message }).Count) {
+            if (-not @($Audit.Issues | Where-Object { (Test-SamePath $_.SourceFile $issue.SourceFile) -and $_.LineNumber -eq $issue.LineNumber -and $_.Message -eq $issue.Message }).Count) {
                 [void]$Audit.Issues.Add($issue)
             }
         }
     } catch { Add-Issue $Audit $_.Exception.Message $Audit.Root }
-    $matchesByPath = @{}; $ambiguitiesByPath = @{}
+    $matchesByPath = New-PathMap; $ambiguitiesByPath = New-PathMap
     foreach ($reference in $Audit.References) {
         if ($reference.Status -eq 'Resolved') {
             if (-not $matchesByPath.ContainsKey($reference.ResolvedPath)) { $matchesByPath[$reference.ResolvedPath] = New-Object System.Collections.ArrayList }
@@ -452,7 +527,7 @@ function Invoke-Audit($Audit) {
         }
     }
     $rows = foreach ($file in @($Audit.Files | Sort-Object RelativePath)) {
-        if ($file.Excluded -or $file.FullPath -eq $Audit.Master) { continue }
+        if ($file.Excluded -or (Test-SamePath $file.FullPath $Audit.Master)) { continue }
         $matched = @(); if ($matchesByPath.ContainsKey($file.FullPath)) { $matched = @($matchesByPath[$file.FullPath]) }
         $direct = @($matched | Where-Object { $_.Direct })
         $indirect = @($matched | Where-Object { -not $_.Direct })
@@ -474,7 +549,10 @@ function Invoke-Audit($Audit) {
         }
     }
     $Audit.Rows = @($rows)
-    $Audit.Repeated = @($Audit.References | Where-Object { $_.Status -eq 'Resolved' } | Group-Object ResolvedPath | Where-Object { $_.Count -gt 1 })
+    $Audit.Repeated = @($matchesByPath.GetEnumerator() | Where-Object { $_.Value.Count -gt 1 } | ForEach-Object {
+        [pscustomobject]@{ Name = $_.Key; Count = $_.Value.Count; Group = @($_.Value) }
+    })
+    $Audit.Counts = Get-AuditCounts $Audit
     $incomplete = ($Audit.Issues.Count -gt 0 -or @($Audit.References | Where-Object { $_.Status -in @('Unresolved', 'Unsupported') }).Count -gt 0)
     $findings = (@($Audit.Rows | Where-Object { $_.DirectReferenceStatus -ne 'DirectlyReferenced' }).Count -gt 0 -or
         @($Audit.References | Where-Object { $_.Status -ne 'Resolved' -or $_.Cycle }).Count -gt 0 -or $Audit.Repeated.Count -gt 0)
@@ -484,16 +562,34 @@ function Invoke-Audit($Audit) {
     }
 }
 
+function Get-AuditCounts($Audit) {
+    $direct = @($Audit.Rows | Where-Object { $_.DirectReferenceStatus -eq 'DirectlyReferenced' }).Count
+    $counts = [ordered]@{
+        'Total files discovered' = $Audit.Files.Count
+        'Files excluded by extension' = @($Audit.Files | Where-Object { $_.Excluded }).Count
+        'Eligible files checked' = $Audit.Rows.Count
+        'Files directly referenced' = $direct; 'Files not directly referenced' = $Audit.Rows.Count - $direct
+        'Files referenced only indirectly' = @($Audit.Rows | Where-Object { $_.DirectReferenceStatus -ne 'DirectlyReferenced' -and $_.IndirectReferenceStatus -eq 'IndirectlyReferenced' }).Count
+    }
+    foreach ($entry in @(@('Ambiguous references', 'Ambiguous'), @('Unresolved references', 'Unresolved'),
+        @('Unsupported invocations', 'Unsupported'), @('Call targets not found within scanned release', 'MissingInRelease'), @('References outside scanned release', 'OutsideRelease'))) {
+        $counts[$entry[0]] = @($Audit.References | Where-Object { $_.Status -eq $entry[1] }).Count
+    }
+    $counts['Repeated targets'] = $Audit.Repeated.Count
+    $counts['Cycles'] = @($Audit.References | Where-Object { $_.Cycle }).Count
+    $counts['Read errors / other incomplete-analysis reasons'] = $Audit.Issues.Count
+    return $counts
+}
+
 function Get-CoverageSummary($Audit) {
     $s = New-Object 'System.Collections.Generic.List[string]'
-    $s.Add('Release: ' + $Audit.Root)
-    $s.Add('Selected master: ' + $Audit.Master)
+    $s.Add('Release: ' + (ConvertTo-SafeText $Audit.Root))
+    $s.Add('Selected master: ' + (ConvertTo-SafeText $Audit.Master))
     if (-not $Audit.MasterReadable) {
         $s.Add('Result: COULD NOT CHECK - the release or master could not be read.')
-        if ($Audit.Issues.Count) { $s.Add('Reason: ' + $Audit.Issues[0].Message) }
+        if ($Audit.Issues.Count) { $s.Add('Reason: ' + (ConvertTo-SafeText $Audit.Issues[0].Message)) }
         return ($s -join [Environment]::NewLine)
     }
-    $direct = @($Audit.Rows | Where-Object { $_.DirectReferenceStatus -eq 'DirectlyReferenced' })
     $notDirect = @($Audit.Rows | Where-Object { $_.DirectReferenceStatus -ne 'DirectlyReferenced' } | Sort-Object RelativeFilePath)
     if ($notDirect.Count) {
         $s.Add('Result: ' + $(if ($Audit.ExitCode -eq 2) { '' } else { 'NO - ' }) + $notDirect.Count + ' file(s) have no matching call in the master.')
@@ -505,12 +601,12 @@ function Get-CoverageSummary($Audit) {
         $s.Add('Result: YES - all checked files are called by the master.')
     }
     $s.Add('Files checked: ' + $Audit.Rows.Count)
-    $s.Add('Files called by master: ' + $direct.Count)
+    $s.Add('Files called by master: ' + $Audit.Counts['Files directly referenced'])
     $s.Add('Files with no matching call: ' + $notDirect.Count)
-    $s.Add('Skipped: selected master and ' + @($Audit.Files | Where-Object { $_.Excluded }).Count + ' file(s) with excluded extensions (' + ($script:ExcludedExtensions -join ', ') + ').')
+    $s.Add('Skipped: selected master and ' + $Audit.Counts['Files excluded by extension'] + ' file(s) with excluded extensions (' + ($script:ExcludedExtensions -join ', ') + ').')
     if ($Audit.ExitCode -eq 2) {
         $s.Add('Note: Some content or calls could not be checked. Files below have no confirmed call; review unresolved calls if needed.')
-        if ($Audit.Issues.Count) { $s.Add('Reason: ' + $Audit.Issues[0].Message) }
+        if ($Audit.Issues.Count) { $s.Add('Reason: ' + (ConvertTo-SafeText $Audit.Issues[0].Message)) }
     } elseif (@($Audit.References | Where-Object { $_.Status -eq 'Ambiguous' }).Count) {
         $s.Add('Note: An ambiguous filename could not be matched to a specific file.')
     }
@@ -523,29 +619,18 @@ function Get-CoverageSummary($Audit) {
 
 function Get-Summary($Audit) {
     $s = New-Object 'System.Collections.Generic.List[string]'
-    $direct = @($Audit.Rows | Where-Object { $_.DirectReferenceStatus -eq 'DirectlyReferenced' })
     $notDirect = @($Audit.Rows | Where-Object { $_.DirectReferenceStatus -ne 'DirectlyReferenced' })
-    $onlyIndirect = @($notDirect | Where-Object { $_.IndirectReferenceStatus -eq 'IndirectlyReferenced' })
     $s.Add('Release Script Checker - static references only; no release scripts were executed.')
-    $s.Add('Release: ' + $Audit.Root); $s.Add('Selected master: ' + $Audit.Master)
+    $s.Add('Release: ' + (ConvertTo-SafeText $Audit.Root)); $s.Add('Selected master: ' + (ConvertTo-SafeText $Audit.Master))
     $s.Add('Result: ' + $(if ($Audit.ExitCode -eq 2) { 'INCOMPLETE / FAILED - coverage is provisional.' } elseif ($Audit.ExitCode -eq 1) { 'Completed with findings.' } else { 'Completed with no findings.' }))
     $s.Add('Mode: ' + $(if ($Audit.Nested) { 'Direct and reachable nested calls' } else { 'Direct master calls only' }))
-    $s.Add('Assumed working directory (START/@): ' + $Audit.WorkingDirectory)
+    $s.Add('Assumed working directory (START/@): ' + (ConvertTo-SafeText $Audit.WorkingDirectory))
     $s.Add('Script encoding without BOM: ' + $Audit.Encoding + ' (Unicode BOM overrides).')
     $s.Add('@@ resolves relative to its caller. Default suffix: .sql unless flagged as unknown.')
     $s.Add('UniqueFilename is an inventory match, not proof of runtime lookup. SQLPATH is not searched.')
-    $s.Add('Total files discovered: ' + $Audit.Files.Count)
-    $s.Add('Files excluded by extension: ' + @($Audit.Files | Where-Object { $_.Excluded }).Count)
-    $s.Add('Eligible files checked (master excluded): ' + $Audit.Rows.Count)
-    $s.Add('Files directly referenced: ' + $direct.Count); $s.Add('Files not directly referenced: ' + $notDirect.Count)
-    if ($Audit.Nested) { $s.Add('Files referenced only indirectly: ' + $onlyIndirect.Count) }
-    foreach ($status in @('Ambiguous', 'Unresolved', 'Unsupported', 'MissingInRelease', 'OutsideRelease')) {
-        $label = @{ Ambiguous = 'Ambiguous references'; Unresolved = 'Unresolved references'; Unsupported = 'Unsupported invocations'; MissingInRelease = 'Call targets not found within scanned release'; OutsideRelease = 'References outside scanned release' }[$status]
-        $s.Add($label + ': ' + @($Audit.References | Where-Object { $_.Status -eq $status }).Count)
+    foreach ($entry in $Audit.Counts.GetEnumerator()) {
+        if ($Audit.Nested -or $entry.Key -ne 'Files referenced only indirectly') { $s.Add($entry.Key + ': ' + $entry.Value) }
     }
-    $s.Add('Repeated targets: ' + $Audit.Repeated.Count)
-    $s.Add('Cycles: ' + @($Audit.References | Where-Object { $_.Cycle }).Count)
-    $s.Add('Read errors / other incomplete-analysis reasons: ' + $Audit.Issues.Count)
     $s.Add(''); $s.Add('Not directly called by the selected master (supporting files may not require execution):')
     if (-not $notDirect.Count) { $s.Add('  (none found in the accessible inventory)') }
     foreach ($group in @($notDirect | Group-Object Extension | Sort-Object Name)) {
@@ -582,19 +667,28 @@ function Get-Summary($Audit) {
     }
     if (-not $Audit.Repeated.Count) { $s.Add('  (none)') }
     $s.Add(''); $s.Add('Read errors / incomplete-analysis reasons:')
-    foreach ($issue in $Audit.Issues) { $s.Add('  ' + $issue.SourceFile + ':' + $issue.LineNumber + ' ' + $issue.Message + ' ' + $issue.SourceText) }
+    foreach ($issue in $Audit.Issues) { $s.Add((ConvertTo-SafeText ('  ' + $issue.SourceFile + ':' + $issue.LineNumber + ' ' + $issue.Message + ' ' + $issue.SourceText))) }
     if (-not $Audit.Issues.Count) { $s.Add('  (none)') }
     $s.Add(''); $s.Add('This audit does not prove that a deployment will execute successfully. Exit code: ' + $Audit.ExitCode)
     return ($s -join [Environment]::NewLine)
 }
 
 function Write-ReportCsv([object[]]$Rows, [string[]]$Columns, [string]$Path) {
-    if ($Rows.Count) { $Rows | Select-Object $Columns | Export-Csv -LiteralPath $Path -NoTypeInformation -Encoding UTF8 }
-    else {
-        # Preserve a usable schema for empty/failed audits too.
-        $header = ($Columns | ForEach-Object { '"' + $_ + '"' }) -join ','
-        Set-Content -LiteralPath $Path -Value $header -Encoding UTF8
+    $lines = if ($Rows.Count) {
+        foreach ($row in $Rows) {
+            $safe = [ordered]@{}
+            foreach ($column in $Columns) {
+                $value = ConvertTo-SafeText ([string]$row.$column)
+                # A visible text prefix survives spreadsheet save/reopen, unlike
+                # relying on removable CSV quote/apostrophe escaping alone.
+                if ($value -match '^[\s\p{Cf}]*[=+\-@\uFF1D\uFF0B\uFF0D\uFF20]') { $value = 'text:' + $value }
+                $safe[$column] = $value
+            }
+            [pscustomobject]$safe
+        }
     }
+    if ($Rows.Count) { Write-ReportText $Path @($lines | ConvertTo-Csv -NoTypeInformation) }
+    else { Write-ReportText $Path @(($Columns | ForEach-Object { '"' + $_ + '"' }) -join ',') }
 }
 
 function Select-Master([string]$Root) {
@@ -607,20 +701,20 @@ function Select-Master([string]$Root) {
             if (Test-Path -LiteralPath $expectedMaster -PathType Leaf) {
                 $detectedMaster = (Get-Item -LiteralPath $expectedMaster -Force).FullName
             }
-        } catch { Write-Host ('Master detection warning: ' + $_.Exception.Message) }
+        } catch { Write-Console ('Master detection warning: ' + $_.Exception.Message) }
     }
     if ($detectedMaster) {
-        Write-Host ("`nDetected master: " + $detectedMaster)
+        Write-Console ("`nDetected master: " + $detectedMaster)
         while ($true) {
-            Write-Host ('Is ' + [IO.Path]::GetFileName($detectedMaster) + ' the master script for this hotfix? (Y/N)')
+            Write-Console ('Is ' + [IO.Path]::GetFileName($detectedMaster) + ' the master script for this hotfix? (Y/N)')
             $confirmation = (Read-Host 'Y/N').Trim()
             if ($confirmation -ieq 'Y' -or $confirmation -ieq 'YES') { return $detectedMaster }
             if ($confirmation -ieq 'N' -or $confirmation -ieq 'NO') { break }
-            Write-Host 'Please enter Y or N.'
+            Write-Console 'Please enter Y or N.'
         }
-        Write-Host 'Select the master manually.'
+        Write-Console 'Select the master manually.'
     } else {
-        Write-Host ("`nNo master matching the release folder name was found. Select the master manually.")
+        Write-Console ("`nNo master matching the release folder name was found. Select the master manually.")
     }
     $sqlRoot = Join-Path $Root 'sql'
     $sqlFiles = @()
@@ -631,12 +725,12 @@ function Select-Master([string]$Root) {
             Assert-NoPathLinks $sqlRoot
             Get-Inventory $menuAudit
             $sqlFiles = @($menuAudit.Files | Where-Object { $_.Extension -eq '.sql' -and -not $_.IsLink } | Sort-Object RelativePath)
-        } catch { Write-Host ('Menu warning: ' + $_.Exception.Message) }
-        foreach ($issue in $menuAudit.Issues) { Write-Host ('Menu warning: ' + $issue.Message + ' ' + $issue.SourceFile) }
+        } catch { Write-Console ('Menu warning: ' + $_.Exception.Message) }
+        foreach ($issue in $menuAudit.Issues) { Write-Console ('Menu warning: ' + $issue.Message + ' ' + $issue.SourceFile) }
     }
-    Write-Host "`nSelect the master for: $Root"
-    for ($i = 0; $i -lt $sqlFiles.Count; $i++) { Write-Host ('  {0}. {1}' -f ($i + 1), $sqlFiles[$i].FullPath) }
-    Write-Host '  M. Enter a master .sql path manually (relative to release or absolute)'
+    Write-Console "`nSelect the master for: $Root"
+    for ($i = 0; $i -lt $sqlFiles.Count; $i++) { Write-Console ('  {0}. {1}' -f ($i + 1), $sqlFiles[$i].FullPath) }
+    Write-Console '  M. Enter a master .sql path manually (relative to release or absolute)'
     while ($true) {
         $choice = Read-Host 'Master number, M, or a file path'
         $index = 0
@@ -648,21 +742,21 @@ function Select-Master([string]$Root) {
             Assert-NoPathLinks $master
             if (-not (Test-Path -LiteralPath $master -PathType Leaf)) { throw 'File does not exist or is inaccessible.' }
             return $master
-        } catch { Write-Host ('Invalid master: ' + $_.Exception.Message) }
+        } catch { Write-Console ('Invalid master: ' + $_.Exception.Message) }
     }
 }
 
 function Invoke-Checker {
     if ($Help) {
-        Write-Host 'Release Script Checker - Windows PowerShell 5.1'
-        Write-Host 'No arguments: release paths, automatic master detection and Y/N confirmation.'
-        Write-Host 'Parameters: -ReleasePath <paths> -MasterPath <paths> [-WorkingDirectory <paths>]'
-        Write-Host '            [-IncludeNested] [-ReportDirectory <path>] [-NonInteractive]'
-        Write-Host '            [-DetailedReport] (optional CSVs and full call details)'
-        Write-Host '            [-NoPause] (disable the final wait in an interactive script run)'
-        Write-Host '            [-ScriptEncoding UTF8|Default|Unicode|BigEndianUnicode]'
-        Write-Host 'Alternative batch input: -InputCsv <csv> with ReleasePath,MasterPath,WorkingDirectory columns.'
-        Write-Host 'See README.md for examples and exit codes (0 / 1 / 2).'
+        Write-Console 'Release Script Checker - Windows PowerShell 5.1'
+        Write-Console 'No arguments: release paths, automatic master detection and Y/N confirmation.'
+        Write-Console 'Parameters: -ReleasePath <paths> -MasterPath <paths> [-WorkingDirectory <paths>]'
+        Write-Console '            [-IncludeNested] [-ReportDirectory <path>] [-NonInteractive]'
+        Write-Console '            [-DetailedReport] (optional CSVs and full call details)'
+        Write-Console '            [-NoPause] (disable the final wait in an interactive script run)'
+        Write-Console '            [-ScriptEncoding UTF8|Default|Unicode|BigEndianUnicode] [-MaxScriptSizeMB 64]'
+        Write-Console 'Alternative batch input: -InputCsv <csv> with ReleasePath,MasterPath,WorkingDirectory columns.'
+        Write-Console 'See README.md for examples and exit codes (0 / 1 / 2).'
         return 0
     }
     $jobs = New-Object System.Collections.ArrayList
@@ -683,8 +777,8 @@ function Invoke-Checker {
             [void]$jobs.Add(@{ Release = $ReleasePath[$i]; Master = $MasterPath[$i]; Working = $wd })
         }
     } else {
-        Write-Host 'Release Script Checker - check files called by the master'
-        Write-Host 'Enter release folders one per line; submit a blank line when finished.'
+        Write-Console 'Release Script Checker - check files called by the master'
+        Write-Console 'Enter release folders one per line; submit a blank line when finished.'
         while ($true) {
             $prompt = if ($jobs.Count) { 'Another release folder (press Enter to choose masters)' } else { 'Release folder' }
             $entered = Read-Host $prompt
@@ -694,18 +788,18 @@ function Invoke-Checker {
                 Assert-NoPathLinks $root
                 if (-not (Test-Path -LiteralPath $root -PathType Container)) { throw 'Directory does not exist or is inaccessible.' }
                 if (Test-InRoot $PSScriptRoot $root) { throw 'The utility must be outside the release folder.' }
-                if (@($jobs | Where-Object { $_.Release -eq $root }).Count) {
-                    Write-Host ('Already added: ' + $root)
-                    Write-Host 'Press Enter on the empty prompt to continue to master selection, or enter a different release folder.'
+                if (@($jobs | Where-Object { Test-SamePath $_.Release $root }).Count) {
+                    Write-Console ('Already added: ' + $root)
+                    Write-Console 'Press Enter on the empty prompt to continue to master selection, or enter a different release folder.'
                     continue
                 }
                 [void]$jobs.Add(@{ Release = $root; Master = ''; Working = '' })
-                Write-Host ('Added release: ' + $root)
-                Write-Host 'Press Enter on the empty prompt to continue to master selection, or enter another release folder.'
-            } catch { Write-Host ('Invalid release: ' + $_.Exception.Message) }
+                Write-Console ('Added release: ' + $root)
+                Write-Console 'Press Enter on the empty prompt to continue to master selection, or enter another release folder.'
+            } catch { Write-Console ('Invalid release: ' + $_.Exception.Message) }
         }
-        if (-not $jobs.Count) { Write-Host 'No releases selected.'; return 2 }
-        Write-Host ('Releases selected: ' + $jobs.Count + '. Next, confirm or select a master for each release.')
+        if (-not $jobs.Count) { Write-Console 'No releases selected.'; return 2 }
+        Write-Console ('Releases selected: ' + $jobs.Count + '. Next, confirm or select a master for each release.')
         if ($WorkingDirectory -and $WorkingDirectory.Count -ne 1 -and $WorkingDirectory.Count -ne $jobs.Count) { throw 'WorkingDirectory must have one value, or one per release.' }
         for ($i = 0; $i -lt $jobs.Count; $i++) {
             $jobs[$i].Master = Select-Master $jobs[$i].Release
@@ -721,19 +815,18 @@ function Invoke-Checker {
             $master = Get-NormalPath $job.Master $root
             $wd = if ($job.Working) { Get-NormalPath $job.Working $root } else { [IO.Path]::GetDirectoryName($master) }
         } catch { $inputError = 'Invalid release/master/working path: ' + $_.Exception.Message }
-        if ($normalizedRoot -and (Test-InRoot $PSScriptRoot $root)) { throw "Move the utility outside the scanned release: $root" }
+        if ($normalizedRoot -and (Test-LocationInRoot $PSScriptRoot $root)) { throw "Move the utility outside the scanned release: $root" }
         $audit = New-Audit $root $master $wd ([bool]$IncludeNested)
         $audit.InputError = $inputError; $audit.NormalizedRoot = $normalizedRoot
         [void]$audits.Add($audit)
     }
     if (-not $ReportDirectory) { $ReportDirectory = Join-Path $PSScriptRoot 'reports' }
     $reportRoot = Get-NormalPath $ReportDirectory
-    foreach ($audit in $audits) {
-        if ($audit.NormalizedRoot -and (Test-InRoot $reportRoot $audit.Root)) { throw "ReportDirectory must be outside ALL scanned releases: $($audit.Root)" }
-    }
-    Assert-NoPathLinks $reportRoot
-    $runFolder = Join-Path $reportRoot ((Get-Date -Format 'yyyyMMdd_HHmmss_fff') + '_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
-    [void](New-Item -ItemType Directory -Path $runFolder -Force)
+    $script:ReportAudits = @($audits)
+    Assert-ReportLocation $reportRoot
+    $runFolder = Join-Path $reportRoot ((Get-Date -Format 'yyyyMMdd_HHmmss_fff') + '_' + [guid]::NewGuid().ToString('N'))
+    [void](New-Item -ItemType Directory -Path $runFolder)
+    Assert-ReportLocation $runFolder
     $script:LastRunFolder = $runFolder
     $fileColumns = @('ReleaseRoot', 'SelectedMaster', 'RelativeFilePath', 'Extension', 'DirectReferenceStatus', 'IndirectReferenceStatus', 'MatchingMethod', 'ReferenceSourceFile', 'SourceLineNumbers', 'NumberOfDetectedCalls', 'DirectCallCount', 'IndirectCallCount', 'CallChains', 'Notes', 'AuditStatus')
     $refColumns = @('ReleaseRoot', 'SelectedMaster', 'SourceFile', 'LineNumber', 'SourceText', 'Command', 'Target', 'Arguments', 'Direct', 'Status', 'MatchingMethod', 'ResolvedPath', 'Candidates', 'CallChain', 'Notes', 'Cycle')
@@ -741,14 +834,14 @@ function Invoke-Checker {
     $coverageSummaries = New-Object 'System.Collections.Generic.List[string]'
     foreach ($audit in $audits) {
         $index++
-        Write-Host ("`nChecking release: " + $audit.Root)
-        if ($DetailedReport) { Write-Host ('Selected master: ' + $audit.Master) }
+        Write-Console ("`nChecking release: " + (ConvertTo-SafeText $audit.Root))
+        if ($DetailedReport) { Write-Console ('Selected master: ' + (ConvertTo-SafeText $audit.Master)) }
         Invoke-Audit $audit
         if (-not $DetailedReport) {
             # Simple mode answers file coverage only. Extra/missing call targets,
             # repeated calls and cycles do not make complete coverage fail.
             if ($audit.ExitCode -ne 2) {
-                $audit.ExitCode = if (@($audit.Rows | Where-Object { $_.DirectReferenceStatus -ne 'DirectlyReferenced' }).Count) { 1 } else { 0 }
+                $audit.ExitCode = if ($audit.Counts['Files not directly referenced']) { 1 } else { 0 }
             }
             $coverageSummaries.Add((Get-CoverageSummary $audit))
             if ($audit.ExitCode -gt $overall) { $overall = $audit.ExitCode }
@@ -761,13 +854,13 @@ function Invoke-Checker {
         $txt = Join-Path $runFolder ($stem + '_summary.txt')
         $csv = Join-Path $runFolder ($stem + '_files.csv')
         $refsCsv = Join-Path $runFolder ($stem + '_references.csv')
-        Set-Content -LiteralPath $txt -Value $audit.Summary -Encoding UTF8
+        Write-ReportText $txt @($audit.Summary)
         Write-ReportCsv @($audit.Rows) $fileColumns $csv
         Write-ReportCsv @($audit.References) $refColumns $refsCsv
         $audit.ReportPaths = @($txt, $csv, $refsCsv)
-        Write-Host "`n$($audit.Summary)"
-        Write-Host "`nReports:"
-        foreach ($report in $audit.ReportPaths) { Write-Host ('  ' + $report) }
+        Write-Console "`n$($audit.Summary)"
+        Write-Console "`nReports:"
+        foreach ($report in $audit.ReportPaths) { Write-Console ('  ' + $report) }
         if ($audit.ExitCode -gt $overall) { $overall = $audit.ExitCode }
     }
     if (-not $DetailedReport) {
@@ -776,37 +869,27 @@ function Invoke-Checker {
         if ($audits.Count -gt 1) { $summary += 'Releases checked: ' + $audits.Count + [Environment]::NewLine }
         $summary += [Environment]::NewLine + ($coverageSummaries -join ([Environment]::NewLine + [Environment]::NewLine))
         $summary += [Environment]::NewLine + [Environment]::NewLine + 'Summary saved to: ' + $summaryPath
-        Set-Content -LiteralPath $summaryPath -Value $summary -Encoding UTF8
-        Write-Host ("`n" + $summary)
+        Write-ReportText $summaryPath @($summary)
+        Write-Console ("`n" + $summary)
         return $overall
     }
-    $totalFiles = 0; $excluded = 0; $eligible = 0; $direct = 0; $notDirect = 0; $indirect = 0
-    $ambiguous = 0; $unresolved = 0; $missing = 0; $external = 0; $repeated = 0; $readIssues = 0
-    foreach ($audit in $audits) {
-        $totalFiles += $audit.Files.Count; $eligible += $audit.Rows.Count
-        $excluded += @($audit.Files | Where-Object { $_.Excluded }).Count
-        $direct += @($audit.Rows | Where-Object { $_.DirectReferenceStatus -eq 'DirectlyReferenced' }).Count
-        $notDirect += @($audit.Rows | Where-Object { $_.DirectReferenceStatus -ne 'DirectlyReferenced' }).Count
-        $indirect += @($audit.Rows | Where-Object { $_.DirectReferenceStatus -ne 'DirectlyReferenced' -and $_.IndirectReferenceStatus -eq 'IndirectlyReferenced' }).Count
-        $ambiguous += @($audit.References | Where-Object { $_.Status -eq 'Ambiguous' }).Count
-        $unresolved += @($audit.References | Where-Object { $_.Status -in @('Unresolved', 'Unsupported') }).Count
-        $missing += @($audit.References | Where-Object { $_.Status -eq 'MissingInRelease' }).Count
-        $external += @($audit.References | Where-Object { $_.Status -eq 'OutsideRelease' }).Count
-        $repeated += $audit.Repeated.Count; $readIssues += $audit.Issues.Count
+    $totals = @('Release Script Checker - combined totals', ('Releases reviewed: ' + $audits.Count))
+    foreach ($label in $audits[0].Counts.Keys) {
+        $value = ($audits | ForEach-Object { $_.Counts[$label] } | Measure-Object -Sum).Sum
+        if ($label -eq 'Files referenced only indirectly' -and -not $IncludeNested) { $value = 'Not checked (direct-only mode)' }
+        if ($label -eq 'Unresolved references') {
+            $value += ($audits | ForEach-Object { $_.Counts['Unsupported invocations'] } | Measure-Object -Sum).Sum
+            $displayLabel = 'Unresolved / unsupported references'
+        } elseif ($label -eq 'Unsupported invocations') { continue }
+        else { $displayLabel = $label.Replace('scanned release', 'scanned releases') }
+        $totals += $displayLabel + ': ' + $value
     }
-    $totals = @('Release Script Checker - combined totals', ('Releases reviewed: ' + $audits.Count),
-        ('Total files discovered: ' + $totalFiles), ('Files excluded by extension: ' + $excluded),
-        ('Eligible files checked: ' + $eligible), ('Files directly referenced: ' + $direct),
-        ('Files not directly referenced: ' + $notDirect),
-        ('Files referenced only indirectly: ' + $(if ($IncludeNested) { $indirect } else { 'Not checked (direct-only mode)' })),
-        ('Ambiguous references: ' + $ambiguous), ('Unresolved / unsupported references: ' + $unresolved),
-        ('Call targets not found within scanned releases: ' + $missing), ('References outside scanned releases: ' + $external),
-        ('Repeated targets: ' + $repeated), ('Read errors / other incomplete-analysis reasons: ' + $readIssues),
-        ('Incomplete / failed releases: ' + @($audits | Where-Object { $_.ExitCode -eq 2 }).Count),
-        ('Overall exit code: ' + $overall)) -join [Environment]::NewLine
+    $totals += 'Incomplete / failed releases: ' + @($audits | Where-Object { $_.ExitCode -eq 2 }).Count
+    $totals += 'Overall exit code: ' + $overall
+    $totals = $totals -join [Environment]::NewLine
     $combined = Join-Path $runFolder 'combined_summary.txt'
-    Set-Content -LiteralPath $combined -Value $totals -Encoding UTF8
-    Write-Host "`n$totals`nCombined summary: $combined"
+    Write-ReportText $combined @($totals)
+    Write-Console "`n$totals`nCombined summary: $combined"
     return $overall
 }
 
@@ -818,24 +901,24 @@ if ($MyInvocation.InvocationName -ne '.') {
     try { $code = Invoke-Checker }
     catch {
         $failure = $_
-        Write-Host ('INCOMPLETE / FAILED: ' + $failure.Exception.Message)
+        Write-Console ('INCOMPLETE / FAILED: ' + (ConvertTo-SafeText $failure.Exception.Message))
         # LastRunFolder is set only after the report destination passes all guards.
         # Preserve diagnostics there if an unexpected failure follows.
         if ($script:LastRunFolder) {
             try {
                 $errorReport = Join-Path $script:LastRunFolder 'checker_error.txt'
-                Set-Content -LiteralPath $errorReport -Encoding UTF8 -Value @(
-                    ('INCOMPLETE / FAILED: ' + $failure.Exception.Message),
+                Write-ReportText $errorReport @(
+                    ('INCOMPLETE / FAILED: ' + (ConvertTo-SafeText $failure.Exception.Message)),
                     $failure.ScriptStackTrace, 'Exit code: 2'
                 )
-                Write-Host ('Error details: ' + $errorReport)
-            } catch { Write-Host ('Unable to save error details: ' + $_.Exception.Message) }
+                Write-Console ('Error details: ' + $errorReport)
+            } catch { Write-Console ('Unable to save error details: ' + $_.Exception.Message) }
         }
     }
     finally {
         if ($interactiveRun -and -not $NoPause) {
-            Write-Host "`nPress Enter to close this window."
-            try { [void](Read-Host) } catch { Write-Host ('Unable to wait for input: ' + $_.Exception.Message) }
+            Write-Console "`nPress Enter to close this window."
+            try { [void](Read-Host) } catch { Write-Console ('Unable to wait for input: ' + $_.Exception.Message) }
         }
     }
     exit $code
