@@ -29,7 +29,8 @@ evaluated as PowerShell, SQL, shell commands, variables, or expressions.
 
 ## Review and verification
 
-- All **601 assertions passed** under Windows PowerShell 5.1. Existing parser,
+- All **612 assertions passed** under Windows PowerShell 5.1, including the 601
+  original security-review assertions. Existing parser,
   matching, reports, encoding, error handling, nested traversal, and interactive
   behavior cases were retained alongside the security regressions.
 - Real child PowerShell and CMD processes verified master auto-detection and Y/N
@@ -62,7 +63,8 @@ One strict encoding/BOM table replaces separate decoder construction branches.
 Common report writers centralize text escaping and safe file creation. The CMD
 launcher is **8 lines instead of 11**, retaining its single interactive pause.
 
-The PowerShell source is **925 lines instead of 842**. Removed duplication was
+The PowerShell source is **958 lines instead of 842**, including the mapped-drive
+follow-up below. Removed duplication was
 offset by the added security protections. No lexer, resolution, validation,
 read-only safeguard, or established feature was removed to force a smaller
 source file. Master detection, all 14 exclusions, one default TXT for multiple
@@ -94,6 +96,29 @@ not source files or the filename values used for coverage matching.
   values from the release; no automatic secret redaction is performed. The
   checker does not upload or transmit reports.
 
+## Mapped-drive performance follow-up
+
+A reported stall after `Checking release` involved a mapped network drive.
+Inspection found that the checker evaluated PowerShell's lazy `LinkType` and
+`Target` properties for every inventory entry. Provider metadata queries on
+ordinary files were unnecessary. The checker now examines the cached
+`ReparsePoint` attribute first and queries link properties only for reparse
+entries. Junction checks and cloud-placeholder handling remain covered by tests.
+The exact stall on the user's work share could not be reproduced here.
+
+Ordinary SQL lines without quote/comment markers and without an active literal
+or block-comment state also avoid character-by-character lexing. All other
+lines retain the full lexer. Phase messages and throttled file/line progress
+make ongoing work visible; `-Verbose` adds folder and script details. The saved
+summary stays unchanged. Native Windows calls can still wait on server timeouts.
+
+On this host, a test modeling slow metadata getters made 60 extra queries before
+the fix and zero after it for 20 ordinary-entry checks. A 10,000-line ordinary
+SQL sample took 5.143 seconds before and 1.416 seconds after, with the same one
+call detected. These are local measurements, not live network benchmarks or
+performance guarantees. The 612-assertion suite and real-hotfix comparison
+passed; real release files retained their hashes and coverage results.
+
 ## Primary references
 
 - [OWASP: CSV Injection](https://community.owasp.org/attacks/CSV_Injection)
@@ -105,3 +130,6 @@ not source files or the filename values used for coverage matching.
 - [Microsoft: CreateFile](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew)
   and [GetFinalPathNameByHandle](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfinalpathnamebyhandlew)
   document metadata handles and resolved filesystem paths.
+- [PowerShell provider source](https://github.com/PowerShell/PowerShell/blob/v6.0.0/src/System.Management.Automation/namespaces/FileSystemProvider.cs#L7393)
+  shows the Windows metadata and hardlink queries behind link properties in the
+  .NET Framework implementation.

@@ -20,6 +20,10 @@ The same summary appears in the CMD window and in **one `summary.txt` file** und
 `reports\<timestamp>` beside the utility. Multiple selected releases are included
 in that one file. The window stays open so you can read the result.
 
+While checking, the console shows validation, folder scanning, master reading,
+and saving stages. Longer scans also show file or parsed-line counts. These
+progress messages do not add anything to the saved summary.
+
 Example summary:
 
 ```text
@@ -73,6 +77,13 @@ PowerShell callers can pass paired arrays to `-ReleasePath` and `-MasterPath`.
 Use `-ScriptEncoding Default` for legacy Windows ANSI scripts; the default is
 strict UTF-8, with Unicode BOM detection. `-NoPause` disables the final wait when
 running the PowerShell script interactively. `-Help` lists parameters.
+
+If a mapped drive is slow, use `Check-Release.bat -Verbose` to show each folder
+being scanned and each script being read. The last message identifies the
+operation waiting on Windows or the server. Ordinary files are checked without
+querying PowerShell's extra link metadata; junctions and symbolic links still
+retain their safety checks. A disconnected or unresponsive share can still wait
+for Windows network timeouts.
 
 ## Security and limits
 

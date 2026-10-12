@@ -30,6 +30,7 @@ $ErrorActionPreference = 'Stop'
 $script:ExcludedExtensions = @('.ear', '.java', '.war', '.bc', '.zip',
     '.docx', '.wft', '.perl', '.pl', '.txt', '.cmd', '.sh', '.bat', '.undeploy')
 $script:ReportAudits = @()
+$script:FreeTextCommandPattern = '^\s*(?i:REM(?:A(?:R(?:K)?)?)?|PRO(?:M(?:P(?:T)?)?)?|SPO(?:O(?:L)?)?|DEF(?:I(?:N(?:E)?)?)?|UNDEF\w*|ACC(?:E(?:P(?:T)?)?)?|COL(?:U(?:M(?:N)?)?)?|TTI\w*|BTI\w*)(?:\s|$)'
 
 function New-PathMap { return [Collections.Hashtable]::new([StringComparer]::OrdinalIgnoreCase) }
 function Test-SamePath([string]$Left, [string]$Right) { return [string]::Equals($Left, $Right, [StringComparison]::OrdinalIgnoreCase) }
@@ -39,6 +40,16 @@ function ConvertTo-SafeText([string]$Text, [switch]$Multiline) {
     return [regex]::Replace($Text, $pattern, { param($m) '\u{0:X4}' -f [int]$m.Value[0] })
 }
 function Write-Console([string]$Message) { Write-Host (ConvertTo-SafeText $Message -Multiline) }
+
+function Update-AuditProgress($Audit, [string]$Message, [switch]$Force) {
+    if ($Audit -and $Audit.ShowProgress) {
+        Write-Verbose (ConvertTo-SafeText $Message)
+        if ($Force -or $Audit.ProgressWatch.Elapsed.TotalSeconds -ge 2) {
+            Write-Console ('  ' + (ConvertTo-SafeText $Message))
+            $Audit.ProgressWatch.Restart()
+        }
+    }
+}
 
 function Get-PhysicalPath([string]$Path) {
     if (-not ('ReleaseChecker.NativePaths' -as [type])) {
@@ -141,6 +152,9 @@ function Get-RelativePath([string]$Path, [string]$Root) {
 }
 
 function Test-PathLink($Item) {
+    # LinkType/Target are lazy provider properties and can query remote servers.
+    # Ordinary files, including hardlinks, cannot redirect directory traversal.
+    if (($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) { return $false }
     # OneDrive cloud placeholders also have ReparsePoint; they are not junctions.
     $link = $Item.PSObject.Properties['LinkType']
     $target = $Item.PSObject.Properties['Target']
@@ -175,11 +189,13 @@ function Get-Inventory($Audit) {
     $pending.Push($Audit.Root)
     while ($pending.Count -gt 0) {
         $directory = $pending.Pop()
+        Update-AuditProgress $Audit ('Scanning folder: ' + $directory + ' (' + $Audit.Files.Count + ' files found)')
         # Keep partial results if a directory emits a read error.
         $readErrors = @()
         $items = @(Get-ChildItem -LiteralPath $directory -Force -ErrorAction SilentlyContinue -ErrorVariable readErrors)
         foreach ($e in $readErrors) { Add-Issue $Audit "Directory read error: $e" $directory }
         foreach ($item in $items) {
+            if ($Audit.Files.Count % 250 -eq 0) { Update-AuditProgress $Audit ('Indexing release files: ' + $Audit.Files.Count + ' found') }
             $isLink = Test-PathLink $item
             if ($item.PSIsContainer) {
                 if ($isLink) { Add-Issue $Audit 'Directory link skipped; inventory is incomplete.' $item.FullName }
@@ -206,8 +222,14 @@ function Get-Inventory($Audit) {
 function Get-CodeLine([string]$Line, $State) {
     # A small lexer: comments only outside quotes, doubled quote escapes, and
     # Oracle q'[...]' (including multiline literals). Keep path quotes intact.
-    $out = New-Object Text.StringBuilder
     $startedInLiteral = ($State.Quote -ne '' -or $State.AlternateEnd -ne '')
+    # Most ordinary SQL/call lines need no character-by-character lexing.
+    # Stateful literals and any quote/comment markers still use the full lexer.
+    if (-not $State.Block -and -not $startedInLiteral -and $Line -notmatch '[''"]|--|/\*') {
+        $text = if ($Line -match $script:FreeTextCommandPattern) { '' } else { $Line }
+        return [pscustomobject]@{ Text = $text; StartedInLiteral = $false }
+    }
+    $out = New-Object Text.StringBuilder
     $hasToken = $startedInLiteral
     for ($i = 0; $i -lt $Line.Length; $i++) {
         $c = $Line[$i]
@@ -237,7 +259,7 @@ function Get-CodeLine([string]$Line, $State) {
         if (-not $hasToken -and -not [char]::IsWhiteSpace($c)) {
             $rest = $Line.Substring($i)
             # These SQL*Plus commands contain free text, not SQL string literals.
-            if ($rest -match '^(?i:REM(?:A(?:R(?:K)?)?)?|PRO(?:M(?:P(?:T)?)?)?|SPO(?:O(?:L)?)?|DEF(?:I(?:N(?:E)?)?)?|UNDEF\w*|ACC(?:E(?:P(?:T)?)?)?|COL(?:U(?:M(?:N)?)?)?|TTI\w*|BTI\w*)(?:\s|$)') {
+            if ($rest -match $script:FreeTextCommandPattern) {
                 return [pscustomobject]@{ Text = ''; StartedInLiteral = $startedInLiteral }
             }
             $hasToken = $true
@@ -291,12 +313,13 @@ function Read-Target([string]$Operand) {
     return @{ Target = $t; Arguments = $argsText; Error = '' }
 }
 
-function Read-Script([string]$Path) {
+function Read-Script([string]$Path, $Audit = $null) {
     $calls = New-Object System.Collections.ArrayList
     $issues = New-Object System.Collections.ArrayList
     $suffixUnknown = $false; $syntaxUnknown = $false; $readSucceeded = $false
     $state = @{ Block = $false; Quote = ''; AlternateEnd = '' }
     try {
+        Update-AuditProgress $Audit ('Reading script: ' + $Path)
         # Decode the complete byte array: .NET Framework StreamReader can drop
         # an incomplete UTF-8 sequence at EOF without flushing its decoder.
         $bytes = Read-ScriptBytes $Path
@@ -314,6 +337,7 @@ function Read-Script([string]$Path) {
         $lines = [regex]::Split($text, '\r\n|\n|\r')
         $readSucceeded = $true
         for ($n = 0; $n -lt $lines.Length; $n++) {
+            if ($n % 256 -eq 0) { Update-AuditProgress $Audit ('Parsing ' + [IO.Path]::GetFileName($Path) + ': line ' + ($n + 1) + ' of ' + $lines.Length) }
             $code = Get-CodeLine $lines[$n] $state
             if ($code.StartedInLiteral) { continue }
             $line = $code.Text.Trim()
@@ -440,7 +464,7 @@ function Visit-Script($Audit, [string]$Path, [string[]]$Stack, [string]$Chain) {
     if ($Audit.Visited.ContainsKey($Path)) { return }
     if ($Stack.Count -ge 128) { Add-Issue $Audit 'Nested depth limit (128) reached; analysis incomplete.' $Path; return }
     $Audit.Visited[$Path] = $true
-    if (-not $Audit.Cache.ContainsKey($Path)) { $Audit.Cache[$Path] = Read-Script $Path }
+    if (-not $Audit.Cache.ContainsKey($Path)) { $Audit.Cache[$Path] = Read-Script $Path $Audit }
     $parsed = $Audit.Cache[$Path]
     foreach ($issue in $parsed.Issues) { [void]$Audit.Issues.Add($issue) }
     if ($parsed.SuffixUnknown -and -not $Audit.SuffixUnknown) {
@@ -482,12 +506,14 @@ function New-Audit([string]$Root, [string]$Master, [string]$Working, [bool]$Nest
         SuffixUnknown = $false; SyntaxUnknown = $false; ModelChanged = $false
         ExitCode = 2; Counts = @{}; Summary = ''; ReportPaths = @(); Repeated = @(); MasterReadable = $false
         InputError = ''; NormalizedRoot = $true
+        ShowProgress = $false; ProgressWatch = [Diagnostics.Stopwatch]::StartNew()
     }
 }
 
 function Invoke-Audit($Audit) {
     try {
         if ($Audit.InputError) { throw $Audit.InputError }
+        Update-AuditProgress $Audit 'Validating release and master paths...' -Force
         Assert-NoPathLinks $Audit.Root
         if (-not (Test-Path -LiteralPath $Audit.Root -PathType Container)) { throw 'Release directory does not exist or is inaccessible.' }
         if (-not (Test-InRoot $Audit.Master $Audit.Root)) { throw 'Selected master must be within this release.' }
@@ -496,9 +522,12 @@ function Invoke-Audit($Audit) {
         if (-not (Test-Path -LiteralPath $Audit.Master -PathType Leaf)) { throw 'Selected master does not exist or is inaccessible.' }
         if (-not (Test-Path -LiteralPath $Audit.WorkingDirectory -PathType Container)) { throw 'Assumed working directory does not exist or is inaccessible.' }
         Assert-NoPathLinks $Audit.WorkingDirectory
+        Update-AuditProgress $Audit 'Scanning release folders...' -Force
         Get-Inventory $Audit
+        Update-AuditProgress $Audit ('Inventory complete: ' + $Audit.Files.Count + ' files found.') -Force
         if (-not $Audit.ByPath.ContainsKey($Audit.Master)) { throw 'Selected master was not accessible in the inventory.' }
         $inventoryIssues = @($Audit.Issues)
+        Update-AuditProgress $Audit ('Reading master and checking calls: ' + $Audit.Master) -Force
         # Settings changed by nested scripts persist in SQL*Plus. Rebuild the graph
         # conservatively when a reached setting invalidates default assumptions.
         do {
@@ -514,6 +543,7 @@ function Invoke-Audit($Audit) {
             }
         }
     } catch { Add-Issue $Audit $_.Exception.Message $Audit.Root }
+    Update-AuditProgress $Audit 'Preparing coverage results...' -Force
     $matchesByPath = New-PathMap; $ambiguitiesByPath = New-PathMap
     foreach ($reference in $Audit.References) {
         if ($reference.Status -eq 'Resolved') {
@@ -836,6 +866,7 @@ function Invoke-Checker {
         $index++
         Write-Console ("`nChecking release: " + (ConvertTo-SafeText $audit.Root))
         if ($DetailedReport) { Write-Console ('Selected master: ' + (ConvertTo-SafeText $audit.Master)) }
+        $audit.ShowProgress = $true
         Invoke-Audit $audit
         if (-not $DetailedReport) {
             # Simple mode answers file coverage only. Extra/missing call targets,
@@ -854,6 +885,7 @@ function Invoke-Checker {
         $txt = Join-Path $runFolder ($stem + '_summary.txt')
         $csv = Join-Path $runFolder ($stem + '_files.csv')
         $refsCsv = Join-Path $runFolder ($stem + '_references.csv')
+        Update-AuditProgress $audit 'Saving detailed reports...' -Force
         Write-ReportText $txt @($audit.Summary)
         Write-ReportCsv @($audit.Rows) $fileColumns $csv
         Write-ReportCsv @($audit.References) $refColumns $refsCsv
@@ -869,6 +901,7 @@ function Invoke-Checker {
         if ($audits.Count -gt 1) { $summary += 'Releases checked: ' + $audits.Count + [Environment]::NewLine }
         $summary += [Environment]::NewLine + ($coverageSummaries -join ([Environment]::NewLine + [Environment]::NewLine))
         $summary += [Environment]::NewLine + [Environment]::NewLine + 'Summary saved to: ' + $summaryPath
+        Write-Console '  Saving summary...'
         Write-ReportText $summaryPath @($summary)
         Write-Console ("`n" + $summary)
         return $overall

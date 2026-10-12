@@ -266,6 +266,27 @@ try {
     Assert-Equal $linkAudit.Files.Count 1 'Directory junction is not traversed'
     Assert-Equal $linkAudit.ExitCode 2 'Skipped link clearly makes inventory incomplete'
 
+    # Windows PowerShell link getters can make slow/unsupported network calls.
+    # Ordinary entries must not evaluate those getters at all.
+    $script:ordinaryLinkQueries = 0
+    foreach ($attributes in @([IO.FileAttributes]::Normal, [IO.FileAttributes]::Archive, [IO.FileAttributes]::Directory)) {
+        $ordinaryItem = [pscustomobject]@{ Attributes = $attributes }
+        $ordinaryItem | Add-Member -MemberType ScriptProperty -Name LinkType -Value { $script:ordinaryLinkQueries++; return '' }
+        $ordinaryItem | Add-Member -MemberType ScriptProperty -Name Target -Value { $script:ordinaryLinkQueries++; return @() }
+        Assert-True (-not (Test-PathLink $ordinaryItem)) 'Ordinary files and directories cannot redirect traversal'
+    }
+    Assert-Equal $script:ordinaryLinkQueries 0 'Ordinary inventory and validation avoid lazy link metadata queries'
+    Assert-True (Test-PathLink ([pscustomobject]@{ Attributes = [IO.FileAttributes]::ReparsePoint; LinkType = 'Junction'; Target = @('outside') })) 'Reparse entries still detect junctions'
+    Assert-True (-not (Test-PathLink ([pscustomobject]@{ Attributes = [IO.FileAttributes]::ReparsePoint; LinkType = ''; Target = @() }))) 'Cloud placeholders retain ordinary-file behavior'
+
+    $longPlainLine = 'select ' + [string]::new('a', 100000) + ' from dual;'
+    $plainSqlRoot = New-TestRelease 'Plain SQL workload' ($longPlainLine + "`nPROMPT @decoy.pb`n@payload.pb") @{
+        'sql\payload.pb' = 'select 1 from dual;'; 'sql\decoy.pb' = 'select 2 from dual;'
+    }
+    $plainSqlAudit = Audit-Path $plainSqlRoot
+    Assert-Equal (Row $plainSqlAudit 'sql\payload.pb').DirectCallCount 1 'Long ordinary SQL lines preserve subsequent active calls'
+    Assert-Equal (Row $plainSqlAudit 'sql\decoy.pb').DirectCallCount 0 'Free-text commands remain excluded in optimized lexing'
+
     Write-Host 'Core assertions passed; checking real launcher, reports and automation exits.'
     $cleanRun = Run-Cli @('-ReleasePath', (Join-Path $fixtures 'Clean'), '-MasterPath', 'sql\master.sql', '-NonInteractive') 'clean-batch' $true
     Assert-Equal $cleanRun.ExitCode 0 'BAT launcher preserves exit zero and accepts spaces'
@@ -273,6 +294,8 @@ try {
     $cleanSummary = Get-Content -Raw -LiteralPath (Join-Path $cleanRun.Folder 'summary.txt')
     Assert-True ($cleanSummary -match 'Result: YES - all checked files are called by the master\.' -and $cleanSummary -match 'Files called by master: 1' -and $cleanSummary -match 'Files with no matching call: 0') 'Clean summary directly answers file coverage'
     Assert-True ((Get-Content -Raw -LiteralPath $cleanRun.Log).Contains($cleanSummary.TrimEnd())) 'CMD prints the same summary saved in the TXT'
+    $progressLog = Get-Content -Raw -LiteralPath $cleanRun.Log
+    Assert-True ($progressLog -match '(?s)Validating release and master paths.*Scanning release folders.*Inventory complete: 2 files.*Reading master and checking calls.*Preparing coverage results.*Saving summary') 'Real CMD run reports validation, inventory, parsing, and writing stages'
     Assert-True ($cleanSummary -notmatch 'Detected resolved calls|CallChains|Unresolved / manual review|combined totals') 'Default summary omits detailed call trace sections'
     $uncalledRoot = New-TestRelease 'UncalledFile' 'select 1 from dual;' @{ 'sql\unused.sql' = 'select 2 from dual;' }
     $findingRun = Run-Cli @('-ReleasePath', $uncalledRoot, '-MasterPath', 'sql\master.sql') 'findings-batch' $true

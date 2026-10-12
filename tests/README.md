@@ -53,3 +53,10 @@ controls, invalid-input result-line spoofing, report overwrite/hardlink preventi
 short-name report destinations, reserved devices before/after path normalization
 and alternate streams, explicit size limits, and all five
 supported Unicode BOMs. Fixture paths and hashes must remain unchanged.
+
+Mapped-drive regressions verify that ordinary file/directory entries never
+evaluate lazy LinkType/Target getters, while junction and cloud-placeholder
+behavior is preserved. Long ordinary SQL lines retain subsequent calls, PROMPT
+text remains ignored, and a real CMD run shows each checking stage without
+changing its saved summary. These cases model metadata access; they do not
+connect to a live SMB server.
