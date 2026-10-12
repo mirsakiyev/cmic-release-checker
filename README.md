@@ -1,0 +1,91 @@
+# Release Script Checker
+
+Checks which files in a release folder are directly called by a selected SQL
+master. It only reads files; it never executes scripts or modifies the release.
+
+## Use
+
+Keep `Check-Release.bat` and `Check-Release.ps1` together outside your releases.
+Double-click **Check-Release.bat**:
+
+1. Enter a release folder. Press Enter at the next empty prompt to continue.
+   You can also enter more release folders before the blank line.
+2. The checker detects `sql\<release folder name>.sql` and asks whether it is the
+   master for this hotfix. Enter `Y` to use it. Enter `N` to choose another master
+   by number or use `M` to enter its path. If no matching file exists, the manual
+   selection menu appears automatically. Names are matched ignoring case.
+3. Read the result, counts, and list of files with no matching call in the master.
+
+The same summary appears in the CMD window and in **one `summary.txt` file** under
+`reports\<timestamp>` beside the utility. Multiple selected releases are included
+in that one file. The window stays open so you can read the result.
+
+Example summary:
+
+```text
+Result: NO - 2 file(s) have no matching call in the master.
+Files checked: 5
+Files called by master: 3
+Files with no matching call: 2
+
+Files with no matching call in the master:
+  sql\extra_patch.sql
+  sql\unused_package.pkb
+```
+
+## From CMD
+
+```bat
+Check-Release.bat -ReleasePath "D:\testing\V12-024-2-02-HF-ALC-03" -MasterPath "sql\V12-024-2-02-HF-ALC-03.sql" -NonInteractive
+```
+
+Use `-ReportDirectory "C:\ReleaseAudits"` to change where the summary is saved.
+Reports must be outside every selected release. Existing reports are preserved.
+Windows PowerShell 5.1 is required; no additional tools or modules are needed.
+
+## What counts as called
+
+- Only active `START` (`STA`/`STAR`), `@`, and `@@` calls in the selected master
+  count. Comments, quoted SQL literals, and output commands do not count.
+- Names match case-insensitively as whole filenames/paths, including quoted paths
+  with spaces. Extensionless calls assume `.sql`.
+- All release files are checked recursively except the selected master and files
+  ending in `.ear`, `.java`, `.war`, `.bc`, `.zip`, `.docx`, `.wft`, `.perl`, `.pl`,
+  `.txt`, `.cmd`, `.sh`, `.bat`, or `.undeploy`. These exclusions ignore case.
+- `START`/`@` use the master folder by default; `@@` uses the calling script's
+  folder. `-WorkingDirectory` overrides the `START`/`@` base. An explicit wrong path
+  never falls back to a matching filename. A bare filename can match one unique
+  release file; this does not prove that SQL*Plus will find it at runtime.
+- Variables, ambiguous filenames, unsupported calls, read errors, and skipped
+  links require review. A short note appears when the check is incomplete.
+  An uncalled supporting file does not necessarily indicate a deployment error.
+
+## Optional details and automation
+
+`-DetailedReport` enables the previous full text reports, files/reference CSVs,
+and combined totals. These details are optional; normal runs save only the one
+summary TXT. `-IncludeNested` inspects reachable scripts, but files called only
+indirectly still have no direct call in the master.
+
+For multiple releases from CMD, use `-InputCsv inputs.csv` with columns
+`ReleasePath,MasterPath,WorkingDirectory` (the last column is optional).
+PowerShell callers can pass paired arrays to `-ReleasePath` and `-MasterPath`.
+Use `-ScriptEncoding Default` for legacy Windows ANSI scripts; the default is
+strict UTF-8, with Unicode BOM detection. `-NoPause` disables the final wait when
+running the PowerShell script interactively. `-Help` lists parameters.
+
+Default exit codes: `0` all checked files have matching master calls; `1` some
+files have no matching call; `2` the check is incomplete or failed. The highest
+code wins for multiple releases. In detailed mode, extra/missing targets,
+repetitions, and cycles can also produce `1`.
+
+## Verification
+
+```bat
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\Test-Checker.ps1
+```
+
+Tests cover parsing, direct versus indirect calls, exclusions, safe reports,
+matching CMD/TXT summaries, multiple releases in one TXT, error handling, and
+keeping the interactive window open. See `tests\README.md`. Generated test
+reports stay under `tests\.work`, outside the fixture releases.

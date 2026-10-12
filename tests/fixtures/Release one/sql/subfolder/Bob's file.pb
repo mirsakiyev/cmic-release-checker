@@ -1,0 +1,1 @@
+-- Apostrophe inside a double quoted path.

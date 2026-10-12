@@ -1,0 +1,28 @@
+RelativeFilePath,DirectReferenceStatus,NestedIndirectReferenceStatus,MatchingMethod,DirectCallCount,NestedIndirectCallCount
+docs\config.mystery,NoDirectReferenceFound,NoIndirectReferenceFound,,0,0
+docs\LICENSE,NoDirectReferenceFound,NoIndirectReferenceFound,,0,0
+docs\support.pkb,NoDirectReferenceFound,NoIndirectReferenceFound,,0,0
+docs\support.ps1,NoDirectReferenceFound,NoIndirectReferenceFound,,0,0
+docs\unique.DATA,DirectlyReferenced,NoIndirectReferenceFound,UniqueFilename,1,0
+one\dup.pb,Ambiguous,NoIndirectReferenceFound,,0,0
+other\same.sql,NoDirectReferenceFound,NoIndirectReferenceFound,,0,0
+sql\commented.pb,NoDirectReferenceFound,NoIndirectReferenceFound,,0,0
+sql\create_tables.sql,DirectlyReferenced,NoIndirectReferenceFound,WorkingDirectoryPath,1,0
+sql\MiXeD.PKS,DirectlyReferenced,NoIndirectReferenceFound,WorkingDirectoryPath,1,0
+sql\nested.sql,DirectlyReferenced,NoIndirectReferenceFound,WorkingDirectoryPath,1,0
+sql\old_py_post.pb,NoDirectReferenceFound,NoIndirectReferenceFound,,0,0
+sql\prompt_only.pb,NoDirectReferenceFound,NoIndirectReferenceFound,,0,0
+sql\py_post.pb,DirectlyReferenced,NoIndirectReferenceFound,WorkingDirectoryPath,2,0
+sql\py_post.pb.bak,NoDirectReferenceFound,NoIndirectReferenceFound,,0,0
+sql\py_post.ps,DirectlyReferenced,NoIndirectReferenceFound,WorkingDirectoryPath,1,0
+sql\same.sql,DirectlyReferenced,NoIndirectReferenceFound,WorkingDirectoryPath,2,0
+sql\string_only.pb,NoDirectReferenceFound,NoIndirectReferenceFound,,0,0
+sql\subfolder\Bob's file.pb,DirectlyReferenced,NoIndirectReferenceFound,WorkingDirectoryPath,1,0
+sql\subfolder\indirect.sql,NoDirectReferenceFound,IndirectlyReferenced,CallerRelativePath,0,2
+sql\subfolder\post_install.sql,DirectlyReferenced,NoIndirectReferenceFound,CallerRelativePath,1,0
+sql\subfolder\quoted--name.pb,DirectlyReferenced,NoIndirectReferenceFound,WorkingDirectoryPath,1,0
+sql\subfolder\script with spaces.pb,DirectlyReferenced,NoIndirectReferenceFound,WorkingDirectoryPath,1,0
+sql\subfolder\semi;colon.pb,DirectlyReferenced,NoIndirectReferenceFound,WorkingDirectoryPath,1,0
+sql\subfolder\single quoted.pb,DirectlyReferenced,NoIndirectReferenceFound,WorkingDirectoryPath,1,0
+sql\unrelated.sql,NoDirectReferenceFound,NoIndirectReferenceFound,,0,0
+two\dup.pb,Ambiguous,NoIndirectReferenceFound,,0,0

@@ -1,0 +1,434 @@
+#requires -Version 5.1
+# No Pester, modules, SQL*Plus, or third-party test dependencies are needed.
+$ErrorActionPreference = 'Stop'
+$checker = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\Check-Release.ps1'))
+$launcher = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\Check-Release.bat'))
+. $checker
+$testRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+$fixtures = Join-Path $testRoot 'fixtures'
+$work = Join-Path $testRoot ('.work\' + (Get-Date -Format 'yyyyMMdd_HHmmss') + '_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+[void](New-Item -ItemType Directory -Path $work -Force)
+$script:assertions = 0
+
+function Assert-Equal($Actual, $Expected, [string]$Message) {
+    $script:assertions++
+    if ([string]$Actual -cne [string]$Expected) { throw "$Message - expected [$Expected], got [$Actual]." }
+}
+function Assert-True([bool]$Value, [string]$Message) { Assert-Equal $Value $true $Message }
+function Row($Audit, [string]$Relative) {
+    $rows = @($Audit.Rows | Where-Object { $_.RelativeFilePath -eq $Relative })
+    Assert-Equal $rows.Count 1 "Exactly one eligible row for $Relative"
+    return $rows[0]
+}
+function Audit-Fixture([string]$Name, [bool]$Nested = $false, [string]$Working = '') {
+    $root = Get-NormalPath (Join-Path $fixtures $Name)
+    $master = Join-Path $root 'sql\master.sql'
+    if (-not $Working) { $Working = Split-Path -Parent $master }
+    $audit = New-Audit $root $master $Working $Nested
+    Invoke-Audit $audit
+    return $audit
+}
+function New-TestRelease([string]$Name, [string]$MasterText, [hashtable]$Files) {
+    $root = Join-Path $work $Name
+    [void](New-Item -ItemType Directory -Path (Join-Path $root 'sql') -Force)
+    Set-Content -LiteralPath (Join-Path $root 'sql\master.sql') -Value $MasterText -Encoding UTF8
+    foreach ($relative in $Files.Keys) {
+        $path = Join-Path $root $relative
+        [void](New-Item -ItemType Directory -Path (Split-Path -Parent $path) -Force)
+        Set-Content -LiteralPath $path -Value $Files[$relative] -Encoding UTF8
+    }
+    return $root
+}
+function Audit-Path([string]$Root, [bool]$Nested = $false, [string]$Working = '') {
+    $master = Join-Path $Root 'sql\master.sql'
+    if (-not $Working) { $Working = Split-Path -Parent $master }
+    $audit = New-Audit $Root $master $Working $Nested
+    Invoke-Audit $audit
+    return $audit
+}
+function Run-Cli([string[]]$Arguments, [string]$Name, [bool]$Batch = $false) {
+    $reportRoot = Join-Path $work ($Name + '-reports')
+    $log = Join-Path $work ($Name + '.log')
+    $argsToPass = @($Arguments) + @('-ReportDirectory', $reportRoot)
+    if ($Batch) { & $launcher @argsToPass > $log 2>&1 }
+    else { & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $checker @argsToPass > $log 2>&1 }
+    $processCode = $LASTEXITCODE
+    $folders = @(); if (Test-Path -LiteralPath $reportRoot) { $folders = @(Get-ChildItem -LiteralPath $reportRoot -Directory) }
+    $folder = if ($folders.Count) { $folders[0].FullName } else { '' }
+    return [pscustomobject]@{ ExitCode = $processCode; Folder = $folder; Log = $log }
+}
+function Fixture-Hashes {
+    return @((Get-ChildItem -LiteralPath $fixtures -Recurse -File -Force | Sort-Object FullName | ForEach-Object {
+        $_.FullName + ' ' + (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash
+    })) -join "`n"
+}
+function Run-Interactive([string]$Entry, [string[]]$InputLines, [string]$Name, [bool]$Batch = $false,
+    [switch]$VerifyKeepOpen, [string]$ReportOverride = '', [switch]$NoFinalPause) {
+    $info = New-Object Diagnostics.ProcessStartInfo
+    $info.UseShellExecute = $false; $info.CreateNoWindow = $true
+    $info.RedirectStandardInput = $true; $info.RedirectStandardOutput = $true; $info.RedirectStandardError = $true
+    if ($Batch) {
+        $info.FileName = $env:ComSpec
+        $info.Arguments = '/d /c ""' + $Entry + '""'
+    } else {
+        $info.FileName = (Get-Command powershell.exe).Source
+        $reportPath = if ($ReportOverride) { $ReportOverride } else { Join-Path $work ($Name + '-reports') }
+        $info.Arguments = '-NoProfile -ExecutionPolicy Bypass -File "' + $Entry + '" -ReportDirectory "' + $reportPath + '"'
+        if ($NoFinalPause) { $info.Arguments += ' -NoPause' }
+    }
+    $process = New-Object Diagnostics.Process
+    $process.StartInfo = $info
+    [void]$process.Start()
+    $stdout = if ($VerifyKeepOpen) { $null } else { $process.StandardOutput.ReadToEndAsync() }
+    $stderr = $process.StandardError.ReadToEndAsync()
+    foreach ($line in $InputLines) { $process.StandardInput.WriteLine($line) }
+    $prefix = New-Object 'System.Collections.Generic.List[string]'
+    $heldForClose = $false
+    if ($VerifyKeepOpen) {
+        # Leave stdin open after the menu selection. Verify the process reaches
+        # the final wait, remains alive, and exits only after a separate Enter.
+        $deadline = [DateTime]::UtcNow.AddSeconds(20)
+        while ([DateTime]::UtcNow -lt $deadline) {
+            $lineTask = $process.StandardOutput.ReadLineAsync()
+            $timeLeft = [Math]::Max(1, [int]($deadline - [DateTime]::UtcNow).TotalMilliseconds)
+            if (-not $lineTask.Wait($timeLeft)) { break }
+            if ($null -eq $lineTask.Result) { break }
+            $prefix.Add($lineTask.Result)
+            if ($lineTask.Result -eq 'Press Enter to close this window.') {
+                $heldForClose = -not $process.WaitForExit(250)
+                break
+            }
+        }
+        if (-not $heldForClose) {
+            if (-not $process.HasExited) { $process.Kill() }
+            $process.Dispose()
+            throw "Interactive test $Name did not stay open after completing the audit."
+        }
+        $process.StandardInput.WriteLine('')
+        $stdout = $process.StandardOutput.ReadToEndAsync()
+    }
+    $process.StandardInput.Close()
+    if (-not $process.WaitForExit(20000)) {
+        $process.Kill(); $process.Dispose(); throw "Interactive test $Name did not finish within 20 seconds."
+    }
+    $process.WaitForExit()
+    $output = ($prefix -join [Environment]::NewLine) + [Environment]::NewLine + $stdout.Result + $stderr.Result
+    $exitCode = $process.ExitCode; $process.Dispose()
+    Set-Content -LiteralPath (Join-Path $work ($Name + '.log')) -Value $output -Encoding UTF8
+    return [pscustomobject]@{ ExitCode = $exitCode; Output = $output; HeldForClose = $heldForClose }
+}
+
+try {
+    Write-Host ('Testing on Windows PowerShell ' + $PSVersionTable.PSVersion)
+    Assert-True ($PSVersionTable.PSVersion.Major -eq 5 -and $PSVersionTable.PSVersion.Minor -eq 1) 'Run this harness with Windows PowerShell 5.1'
+    $before = Fixture-Hashes
+    $expected = @(Import-Csv -LiteralPath (Join-Path $testRoot 'expected-release-one.csv'))
+    foreach ($nested in @($false, $true)) {
+        $audit = Audit-Fixture 'Release one' $nested
+        Assert-Equal $audit.Files.Count 36 'All files inventoried'
+        Assert-Equal @($audit.Files | Where-Object { $_.Excluded }).Count 8 'Configured excluded extensions, mixed case'
+        Assert-Equal $audit.Rows.Count 27 'Master excluded, every other eligible file retained'
+        Assert-Equal $audit.ExitCode 2 'Unresolved variable makes the audit incomplete'
+        Assert-Equal $audit.Issues.Count 0 'Fixture text reads and lexes correctly'
+        foreach ($e in $expected) {
+            $row = Row $audit $e.RelativeFilePath
+            Assert-Equal $row.DirectReferenceStatus $e.DirectReferenceStatus "Direct status: $($e.RelativeFilePath)"
+            Assert-Equal $row.DirectCallCount $e.DirectCallCount "Direct call count: $($e.RelativeFilePath)"
+            Assert-Equal $row.IndirectReferenceStatus $(if ($nested) { $e.NestedIndirectReferenceStatus } else { 'NotChecked' }) "Nested status: $($e.RelativeFilePath)"
+            Assert-Equal $row.IndirectCallCount $(if ($nested) { $e.NestedIndirectCallCount } else { 0 }) "Indirect count: $($e.RelativeFilePath)"
+            $method = if (-not $nested -and $e.DirectCallCount -eq '0') { '' } else { $e.MatchingMethod }
+            Assert-Equal $row.MatchingMethod $method "Matching method: $($e.RelativeFilePath)"
+            Assert-Equal $row.AuditStatus 'Incomplete' 'CSV rows signal provisional coverage'
+        }
+        Assert-Equal @($audit.References | Where-Object { $_.Status -eq 'Ambiguous' }).Count 1 'One duplicate-filename ambiguity'
+        Assert-Equal @($audit.References | Where-Object { $_.Status -eq 'MissingInRelease' }).Count 2 'Wrong explicit path and missing call both reported'
+        Assert-Equal @($audit.References | Where-Object { $_.Target -eq 'wrong\py_post.pb' -and $_.Status -eq 'MissingInRelease' }).Count 1 'Wrong path cannot use basename fallback'
+        Assert-Equal @($audit.References | Where-Object { $_.LineNumber -eq 18 -and $_.Target -eq 'py_post.pb' }).Count 1 'Original source line retained'
+        $quoted = @($audit.References | Where-Object { $_.Target -eq 'subfolder\script with spaces.pb' })[0]
+        Assert-Equal $quoted.Arguments 'argument1 "argument two"' 'Arguments are separate from quoted target'
+        Assert-True ((Row $audit 'docs\unique.DATA').Notes -match 'runtime SQL\*Plus lookup is not established') 'Unique filename caveat appears in CSV'
+        Assert-Equal @($audit.References | Where-Object { $_.Cycle }).Count $(if ($nested) { 1 } else { 0 }) 'Cycle detection stops recursion'
+        Assert-Equal $audit.Repeated.Count $(if ($nested) { 3 } else { 2 }) 'Repeated static calls grouped per target'
+        Assert-Equal @($audit.References | Where-Object { $_.SourceFile -like '*unrelated.sql' }).Count 0 'Unrelated scripts never contribute coverage'
+        if ($nested) {
+            $indirect = Row $audit 'sql\subfolder\indirect.sql'
+            Assert-True ($indirect.CallChains -match 'master.sql:22 -> sql\\subfolder\\post_install.sql:1') 'Indirect chain contains master and caller lines'
+            Assert-True ((Get-Summary $audit) -match 'Files not directly referenced: 14') 'Indirectly called file remains in not-direct total'
+        }
+    }
+    Assert-Equal (Audit-Fixture 'Clean').ExitCode 0 'Clean fixture exit zero'
+    Assert-Equal (Audit-Fixture 'Clean' $true).ExitCode 0 'Clean nested audit exit zero'
+    $second = Audit-Fixture 'Release two'
+    Assert-Equal $second.ExitCode 1 'Completed fixture with findings exit one'
+    Assert-Equal $second.References[0].Status 'MissingInRelease' 'Another release cannot satisfy a missing call'
+
+    $settingsDirect = Audit-Fixture 'Settings'
+    Assert-Equal (Row $settingsDirect 'sql\default_name.sql').DirectReferenceStatus 'DirectlyReferenced' 'Direct mode uses declared default assumptions only'
+    $settingsNested = Audit-Fixture 'Settings' $true
+    Assert-Equal $settingsNested.ExitCode 2 'Nested suffix setting makes audit incomplete'
+    Assert-Equal (Row $settingsNested 'sql\default_name.sql').DirectReferenceStatus 'NoDirectReferenceFound' 'Nested setting invalidates prior default suffix matches'
+    Assert-Equal (Row $settingsNested 'sql\default_name.pb').DirectReferenceStatus 'NoDirectReferenceFound' 'No alternate extension guessed'
+    Assert-True (@($settingsNested.References | Where-Object { $_.Status -eq 'Unresolved' -and $_.Target -eq 'default_name' }).Count -eq 1) 'Extensionless target is manual review'
+
+    $context = New-TestRelease 'Context' '@@sub\driver.sql' @{
+        'sql\sub\driver.sql' = "@@leaf.sql`n@leaf.sql`nSTART leaf.sql"
+        'sql\sub\leaf.sql' = 'select 1 from dual;'
+        'working\leaf.sql' = 'select 2 from dual;'
+    }
+    $contextAudit = Audit-Path $context $true (Join-Path $context 'working')
+    Assert-Equal (Row $contextAudit 'sql\sub\leaf.sql').IndirectCallCount 1 '@@ uses its caller directory'
+    Assert-Equal (Row $contextAudit 'working\leaf.sql').IndirectCallCount 2 'START/@ retain override working directory in nested scripts'
+    Assert-Equal @($contextAudit.References | Where-Object { $_.Status -eq 'Ambiguous' }).Count 0 'Path context disambiguates duplicate basenames'
+
+    $absolute = New-TestRelease 'Absolute' '-- placeholder' @{ 'payload.bintext' = 'select 1 from dual;' }
+    $outside = Join-Path $work 'Outside\external.sql'
+    Set-Content -LiteralPath (Join-Path $absolute 'sql\master.sql') -Encoding UTF8 -Value @(
+        ('start "' + (Join-Path $absolute 'sql\..\payload.bintext') + '"'),
+        ('@"' + $outside + '"'), '@\\nonexistent-checker-host\share\external.sql',
+        '@https://example.invalid/external.sql?x=1&y=2'
+    )
+    $absoluteAudit = Audit-Path $absolute
+    Assert-Equal (Row $absoluteAudit 'payload.bintext').MatchingMethod 'AbsolutePath' 'Normalized absolute path resolves'
+    Assert-Equal @($absoluteAudit.References | Where-Object { $_.Status -eq 'OutsideRelease' }).Count 3 'Absolute external, UNC, URL separated without probing'
+    Assert-Equal $absoluteAudit.ExitCode 1 'External reference findings do not claim machine-wide absence'
+    Assert-True (-not (Test-InRoot ($absolute + 'Sibling\file.sql') $absolute)) 'Root boundary does not accept a prefix sibling'
+
+    $manual = New-TestRelease 'Manual' "host echo unsupported`n! echo unsupported`n:r child.sql`n@&name`nstart -`nchild.sql`nSTART`n@'unterminated`n@child.sql" @{ 'sql\child.sql' = 'select 1 from dual;' }
+    $manualAudit = Audit-Path $manual
+    Assert-Equal @($manualAudit.References | Where-Object { $_.Status -eq 'Unsupported' }).Count 3 'HOST, !, and SQLCMD :r require review'
+    Assert-Equal @($manualAudit.References | Where-Object { $_.Status -eq 'Unresolved' }).Count 4 'Variable, continuation, missing operand, unclosed target require review'
+    Assert-Equal (Row $manualAudit 'sql\child.sql').DirectCallCount 1 'Malformed command does not hide later valid call'
+    Assert-Equal $manualAudit.ExitCode 2 'Unsupported commands cannot yield a clean audit'
+    $concat = New-TestRelease 'Concatenation' "start 'child' || '.sql'" @{ 'sql\child.sql' = 'select 1 from dual;' }
+    Assert-Equal (Audit-Path $concat).References[0].Status 'Unresolved' 'Possible filename concatenation requires review'
+    $sqlClause = New-TestRelease 'SqlClause' "select id from tree`nSTART WITH id=1`nconnect by prior id=parent_id;" @{ 'sql\with.sql' = 'select 1 from dual;' }
+    Assert-Equal (Row (Audit-Path $sqlClause) 'sql\with.sql').DirectCallCount 0 'SQL START WITH clause cannot call a file named with.sql'
+    Assert-Equal (Audit-Path $sqlClause).ExitCode 2 'START WITH clause or unquoted WITH target requires review'
+    $extensionless = New-TestRelease 'Extensionless' '@payload' @{ 'sql\payload.pb' = 'select 1 from dual;'; 'sql\payload.ps' = 'select 1 from dual;' }
+    $extensionlessAudit = Audit-Path $extensionless
+    Assert-Equal $extensionlessAudit.References[0].Status 'MissingInRelease' 'Extensionless target never guesses .pb or .ps'
+    Assert-True ($extensionlessAudit.References[0].ResolvedPath.EndsWith('payload.sql')) 'Missing extensionless target records assumed .sql path'
+    $freeText = New-TestRelease 'FreeText' "REM q'[`nPROMPT 'never closed`nSPOOL Bob's.log`n@child.sql" @{ 'sql\child.sql' = 'select 1 from dual;' }
+    Assert-Equal (Audit-Path $freeText).ExitCode 0 'Free-text comments/logging quotes do not hide calls'
+    $badBlock = New-TestRelease 'BadBlock' "/* unterminated`n@child.sql" @{ 'sql\child.sql' = 'select 1 from dual;' }
+    Assert-Equal (Audit-Path $badBlock).ExitCode 2 'Unterminated block comment makes analysis incomplete'
+    $changedSyntax = New-TestRelease 'SyntaxSetting' "set def ^`n@child.sql" @{ 'sql\child.sql' = 'select 1 from dual;' }
+    Assert-Equal (Audit-Path $changedSyntax).References[0].Status 'Unresolved' 'Custom substitution setting prevents confident matching'
+    $standardDefine = New-TestRelease 'StandardDefine' "START first.pb`nset define on`n@second.ps`nset def off`n@second.ps`n@&dynamic" @{
+        'sql\first.pb' = 'select 1 from dual;'; 'sql\second.ps' = 'select 2 from dual;'
+    }
+    $standardDefineAudit = Audit-Path $standardDefine
+    Assert-Equal (Row $standardDefineAudit 'sql\first.pb').DirectCallCount 1 'SET DEFINE ON preserves literal calls before the setting'
+    Assert-Equal (Row $standardDefineAudit 'sql\second.ps').DirectCallCount 2 'SET DEFINE ON/OFF preserves literal calls after the settings'
+    Assert-Equal $standardDefineAudit.Issues.Count 0 'Standard DEFINE toggles do not invalidate the parser'
+    Assert-Equal @($standardDefineAudit.References | Where-Object { $_.Status -eq 'Unresolved' }).Count 1 'Variable-bearing call still requires review'
+    $nestedDefine = New-TestRelease 'NestedDefine' "@child.sql`n@leaf.pb" @{
+        'sql\child.sql' = 'set define on'; 'sql\leaf.pb' = 'select 1 from dual;'
+    }
+    Assert-Equal (Audit-Path $nestedDefine $true).ExitCode 0 'Standard DEFINE toggle in a nested script preserves literal graph matches'
+
+    $foreign = New-TestRelease 'Foreign' '@payload.ps1' @{ 'sql\payload.ps1' = "throw 'Do not execute me'" }
+    Assert-Equal (Audit-Path $foreign).ExitCode 0 'Any explicit extension remains eligible for direct matching'
+    Assert-Equal (Audit-Path $foreign $true).ExitCode 2 'Unsupported nested language is incomplete'
+    $binary = New-TestRelease 'Binary' '@child.pb' @{ 'sql\child.pb' = 'placeholder' }
+    [IO.File]::WriteAllBytes((Join-Path $binary 'sql\child.pb'), [byte[]]@(0, 1, 2, 3))
+    Assert-Equal (Audit-Path $binary $true).ExitCode 2 'Binary nested content is incomplete'
+
+    $lockedRoot = Join-Path $fixtures 'Clean'
+    $lockedMaster = Join-Path $lockedRoot 'sql\master.sql'
+    $lock = New-Object IO.FileStream($lockedMaster, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)
+    try {
+        $locked = Audit-Fixture 'Clean'
+        Assert-Equal $locked.ExitCode 2 'Unreadable master cannot produce a clean result'
+        Assert-True ($locked.Issues.Count -gt 0) 'Unreadable master records reason'
+    } finally { $lock.Dispose() }
+    $gone = Join-Path $work 'Nonexistent'
+    $missingAudit = New-Audit $gone (Join-Path $gone 'sql\master.sql') $gone $false
+    Invoke-Audit $missingAudit
+    Assert-Equal $missingAudit.ExitCode 2 'Inaccessible/nonexistent root is failed'
+
+    # A BOM selects UTF-16 automatically. Invalid non-BOM UTF-8 is not guessed.
+    $encoded = New-TestRelease 'Encoding' '@child.sql' @{ 'sql\child.sql' = 'select 1 from dual;' }
+    Set-Content -LiteralPath (Join-Path $encoded 'sql\master.sql') -Value '@child.sql' -Encoding Unicode
+    Assert-Equal (Audit-Path $encoded).ExitCode 0 'UTF-16 BOM detected'
+    [IO.File]::WriteAllBytes((Join-Path $encoded 'sql\master.sql'), [byte[]]@(64, 99, 104, 105, 108, 100, 46, 115, 113, 108, 13, 10, 45, 45, 32, 233))
+    Assert-Equal (Audit-Path $encoded).ExitCode 2 'Invalid UTF-8 fails explicitly'
+    $ScriptEncoding = 'Default'
+    Assert-Equal (Audit-Path $encoded).ExitCode 0 'Explicit system ANSI encoding supported'
+    $ScriptEncoding = 'UTF8'
+
+    $linkRoot = New-TestRelease 'Links' 'select 1 from dual;' @{}
+    $targetRoot = Join-Path $work 'ExternalLinkTarget'
+    [void](New-Item -ItemType Directory -Path $targetRoot)
+    Set-Content -LiteralPath (Join-Path $targetRoot 'external.sql') -Value 'select 1 from dual;'
+    [void](New-Item -ItemType Junction -Path (Join-Path $linkRoot 'external') -Value $targetRoot)
+    $linkAudit = Audit-Path $linkRoot
+    Assert-Equal $linkAudit.Files.Count 1 'Directory junction is not traversed'
+    Assert-Equal $linkAudit.ExitCode 2 'Skipped link clearly makes inventory incomplete'
+
+    Write-Host 'Core assertions passed; checking real launcher, reports and automation exits.'
+    $cleanRun = Run-Cli @('-ReleasePath', (Join-Path $fixtures 'Clean'), '-MasterPath', 'sql\master.sql', '-NonInteractive') 'clean-batch' $true
+    Assert-Equal $cleanRun.ExitCode 0 'BAT launcher preserves exit zero and accepts spaces'
+    Assert-Equal @(Get-ChildItem -LiteralPath $cleanRun.Folder -File).Count 1 'Default run creates exactly one file'
+    $cleanSummary = Get-Content -Raw -LiteralPath (Join-Path $cleanRun.Folder 'summary.txt')
+    Assert-True ($cleanSummary -match 'Result: YES - all checked files are called by the master\.' -and $cleanSummary -match 'Files called by master: 1' -and $cleanSummary -match 'Files with no matching call: 0') 'Clean summary directly answers file coverage'
+    Assert-True ((Get-Content -Raw -LiteralPath $cleanRun.Log).Contains($cleanSummary.TrimEnd())) 'CMD prints the same summary saved in the TXT'
+    Assert-True ($cleanSummary -notmatch 'Detected resolved calls|CallChains|Unresolved / manual review|combined totals') 'Default summary omits detailed call trace sections'
+    $uncalledRoot = New-TestRelease 'UncalledFile' 'select 1 from dual;' @{ 'sql\unused.sql' = 'select 2 from dual;' }
+    $findingRun = Run-Cli @('-ReleasePath', $uncalledRoot, '-MasterPath', 'sql\master.sql') 'findings-batch' $true
+    Assert-Equal $findingRun.ExitCode 1 'BAT launcher preserves findings exit one'
+    $findingSummary = Get-Content -Raw -LiteralPath (Join-Path $findingRun.Folder 'summary.txt')
+    Assert-True ($findingSummary -match 'Result: NO - 1 file\(s\)' -and $findingSummary -match '  sql\\unused\.sql') 'Missing coverage is clearly identified by relative filename'
+    Assert-True ($findingSummary -notmatch '\[NoDirectReferenceFound; NotChecked\]') 'Missing file list has no internal status annotations'
+    $simplePartial = Run-Cli @('-ReleasePath', (Join-Path $fixtures 'Release one'), '-MasterPath', 'sql\master.sql') 'simple-incomplete' $true
+    $partialSummary = Get-Content -Raw -LiteralPath (Join-Path $simplePartial.Folder 'summary.txt')
+    Assert-Equal $simplePartial.ExitCode 2 'Simple summary preserves incomplete coverage status'
+    Assert-Equal @(Get-ChildItem -LiteralPath $simplePartial.Folder -File).Count 1 'Incomplete default run still creates only one TXT'
+    Assert-True ($partialSummary -match 'Files checked: 27' -and $partialSummary -match 'Files called by master: 13' -and $partialSummary -match 'Files with no matching call: 14') 'Simple counts use direct master calls'
+    Assert-True ($partialSummary -match 'Some content or calls could not be checked' -and $partialSummary -notmatch 'Result: YES') 'Unresolved calls cannot produce a false clean result'
+    $partialList = ($partialSummary -split 'Files with no matching call in the master:\r?\n')[1] -split '\r?\n\r?\nSummary saved to:' | Select-Object -First 1
+    Assert-Equal @($partialList -split '\r?\n' | Where-Object { $_.Trim() }).Count 14 'All 14 uncalled files appear once in the plain list'
+    Assert-True ($partialList -match '(?m)^  sql\\subfolder\\indirect\.sql\r?$' -and $partialList -notmatch '(?m)^  sql\\py_post\.pb\r?$') 'List includes indirectly called files and excludes direct matches'
+    $coveredExtras = New-TestRelease 'CoveredExtras' "@child.sql`n@child.sql`n@not-in-release.sql" @{ 'sql\child.sql' = 'select 1 from dual;' }
+    $coverageOnly = Run-Cli @('-ReleasePath', $coveredExtras, '-MasterPath', 'sql\master.sql') 'coverage-only'
+    Assert-Equal $coverageOnly.ExitCode 0 'Default mode checks coverage without treating extra or repeated targets as uncalled release files'
+    $detailedExtras = Run-Cli @('-ReleasePath', $coveredExtras, '-MasterPath', 'sql\master.sql', '-DetailedReport') 'covered-details'
+    Assert-Equal $detailedExtras.ExitCode 1 'Detailed mode retains extra-target and repetition findings'
+    $nestedRun = Run-Cli @('-ReleasePath', (Join-Path $fixtures 'Release one'), '-MasterPath', 'sql\master.sql', '-IncludeNested', '-DetailedReport') 'nested-batch' $true
+    Assert-Equal $nestedRun.ExitCode 2 'BAT launcher preserves incomplete exit two'
+    $fileCsv = @(Import-Csv -LiteralPath (Join-Path $nestedRun.Folder '01_Release_one_files.csv'))
+    $refCsv = @(Import-Csv -LiteralPath (Join-Path $nestedRun.Folder '01_Release_one_references.csv'))
+    Assert-Equal $fileCsv.Count 27 'Report has exactly one row per eligible file'
+    Assert-Equal $refCsv.Count 22 'References CSV contains all direct and reached call sites'
+    Assert-Equal @($fileCsv | Where-Object { $_.AuditStatus -eq 'Incomplete' }).Count 27 'Export preserves audit status'
+    Assert-True ((Get-Content -Raw -LiteralPath (Join-Path $nestedRun.Folder '01_Release_one_summary.txt')) -match 'Unresolved / manual review') 'Text report includes manual review section'
+    Assert-True ((Get-Content -Raw -LiteralPath $nestedRun.Log) -match [regex]::Escape($nestedRun.Folder)) 'Console shows full report paths'
+    Assert-True ((Get-Content -Raw -LiteralPath $nestedRun.Log) -notmatch 'Press Enter to close this window') 'Noninteractive automation has no final wait'
+    $repeatRun = Run-Cli @('-ReleasePath', (Join-Path $fixtures 'Clean'), '-MasterPath', 'sql\master.sql') 'clean-batch' $true
+    Assert-True ($repeatRun.Folder -ne $cleanRun.Folder -or @(Get-ChildItem -LiteralPath (Split-Path -Parent $cleanRun.Folder) -Directory).Count -eq 2) 'Previous run is preserved'
+
+    $inputFile = Join-Path $work 'inputs.csv'
+    @(
+        [pscustomobject]@{ ReleasePath = (Join-Path $fixtures 'Release one'); MasterPath = 'sql\master.sql'; WorkingDirectory = '' },
+        [pscustomobject]@{ ReleasePath = (Join-Path $fixtures 'Release two'); MasterPath = 'sql\master.sql'; WorkingDirectory = '' },
+        [pscustomobject]@{ ReleasePath = $gone; MasterPath = 'sql\master.sql'; WorkingDirectory = '' }
+    ) | Export-Csv -LiteralPath $inputFile -NoTypeInformation -Encoding UTF8
+    $simpleMulti = Run-Cli @('-InputCsv', $inputFile) 'simple-multiple'
+    Assert-Equal $simpleMulti.ExitCode 2 'Single summary preserves invalid release status while checking other releases'
+    Assert-Equal @(Get-ChildItem -LiteralPath $simpleMulti.Folder -File).Count 1 'Multiple releases are collected in one TXT'
+    $multiSummary = Get-Content -Raw -LiteralPath (Join-Path $simpleMulti.Folder 'summary.txt')
+    Assert-Equal @([regex]::Matches($multiSummary, '(?m)^Release:')).Count 3 'One TXT includes a separate coverage summary for every selected release'
+    Assert-True ($multiSummary -match 'Releases checked: 3' -and $multiSummary -match 'Result: COULD NOT CHECK') 'Failed release cannot look like complete zero-file coverage'
+    Assert-True ((Get-Content -Raw -LiteralPath $simpleMulti.Log).Contains($multiSummary.TrimEnd())) 'Multiple-release CMD summary matches the one TXT'
+    $multi = Run-Cli @('-InputCsv', $inputFile, '-DetailedReport') 'multiple'
+    Assert-Equal $multi.ExitCode 2 'Combined incomplete status takes precedence'
+    Assert-Equal @(Get-ChildItem -LiteralPath $multi.Folder -Filter '*_files.csv').Count 3 'Independent report for each release including invalid release'
+    $combined = Get-Content -Raw -LiteralPath (Join-Path $multi.Folder 'combined_summary.txt')
+    Assert-True ($combined -match 'Releases reviewed: 3' -and $combined -match 'Eligible files checked: 27' -and $combined -match 'Files directly referenced: 13') 'Combined totals are correct and readable'
+    Assert-True ($combined -match 'Ambiguous references: 1' -and $combined -match 'Call targets not found within scanned releases: 3') 'Combined reference findings are totaled'
+    Assert-True ($combined -match 'Files referenced only indirectly: Not checked') 'Direct-only combined report does not imply nested checking'
+    Assert-Equal @(Import-Csv -LiteralPath (Join-Path $multi.Folder '03_Nonexistent_files.csv')).Count 0 'Failed audit still has header-only CSV'
+    $failure = Run-Cli @('-ReleasePath', (Join-Path $fixtures 'Clean'), '-MasterPath', 'sql\absent.sql') 'missing-master'
+    Assert-Equal $failure.ExitCode 2 'Missing master produces incomplete reports'
+    $failureSummary = Get-Content -Raw -LiteralPath (Join-Path $failure.Folder 'summary.txt')
+    Assert-True ($failureSummary -match 'COULD NOT CHECK' -and $failureSummary -match 'Selected master does not exist' -and $failureSummary -notmatch 'Result: YES') 'Simple failure summary explains why coverage is unavailable'
+    $lock = New-Object IO.FileStream($lockedMaster, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)
+    try {
+        $lockedRun = Run-Cli @('-ReleasePath', $lockedRoot, '-MasterPath', 'sql\master.sql') 'locked-summary'
+        $lockedSummary = Get-Content -Raw -LiteralPath (Join-Path $lockedRun.Folder 'summary.txt')
+        Assert-Equal $lockedRun.ExitCode 2 'Locked master preserves incomplete exit in simple mode'
+        Assert-True ($lockedSummary -match 'COULD NOT CHECK' -and $lockedSummary -notmatch 'Files with no matching call: 0|Result: YES') 'Unreadable master never produces a misleading coverage summary'
+    } finally { $lock.Dispose() }
+    $outsideMaster = Run-Cli @('-ReleasePath', (Join-Path $fixtures 'Clean'), '-MasterPath', (Join-Path $fixtures 'Release one\sql\master.sql')) 'outside-master'
+    Assert-Equal $outsideMaster.ExitCode 2 'Manual/batch master must remain within its release'
+
+    $badReport = Join-Path $fixtures 'Clean\must-not-create-reports'
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $checker -ReleasePath (Join-Path $fixtures 'Clean') -MasterPath 'sql\master.sql' -ReportDirectory $badReport > (Join-Path $work 'bad-report.log') 2>&1
+    Assert-Equal $LASTEXITCODE 2 'Reports inside release refused'
+    Assert-True (-not (Test-Path -LiteralPath $badReport)) 'Report guard runs before any release write'
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $checker -ReleasePath (Split-Path -Parent $checker) -MasterPath 'tests\fixtures\Clean\sql\master.sql' > (Join-Path $work 'utility-inside.log') 2>&1
+    Assert-Equal $LASTEXITCODE 2 'Utility inside scanned release refused'
+    $reportLink = Join-Path $work 'report-link'
+    [void](New-Item -ItemType Junction -Path $reportLink -Value (Join-Path $fixtures 'Clean'))
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $checker -ReleasePath (Join-Path $fixtures 'Clean') -MasterPath 'sql\master.sql' -ReportDirectory $reportLink > (Join-Path $work 'report-link.log') 2>&1
+    Assert-Equal $LASTEXITCODE 2 'Report junction cannot bypass outside-release rule'
+    # One malformed input must not prevent other release rows from being audited.
+    @(
+        [pscustomobject]@{ ReleasePath = 'C:relative'; MasterPath = 'sql\master.sql' },
+        [pscustomobject]@{ ReleasePath = (Join-Path $fixtures 'Clean'); MasterPath = 'sql\master.sql' }
+    ) | Export-Csv -LiteralPath $inputFile -NoTypeInformation -Encoding UTF8
+    $badInput = Run-Cli @('-InputCsv', $inputFile, '-DetailedReport') 'bad-input'
+    Assert-Equal $badInput.ExitCode 2 'Malformed release path recorded as failure'
+    Assert-Equal @(Import-Csv -LiteralPath (Join-Path $badInput.Folder '02_Clean_files.csv')).Count 1 'Valid release after malformed path is still audited'
+
+    $interactiveRoot = New-TestRelease 'Interactive one' '@payload.pb' @{
+        'sql\01-decoy.sql' = 'select 1 from dual;'; 'sql\payload.pb' = 'select 2 from dual;'
+    }
+    $manualRoot = New-TestRelease 'Interactive two' 'select 1 from dual;' @{
+        'manual\chosen.sql' = '@@leaf.sql'; 'manual\leaf.sql' = 'select 2 from dual;'
+    }
+    $interactive = Run-Interactive $checker @($gone, $interactiveRoot, $interactiveRoot, ($interactiveRoot + '\'), $manualRoot, '', '99', '2', 'M', $lockedMaster, 'M', 'manual\chosen.sql') 'interactive'
+    Assert-Equal $interactive.ExitCode 1 'Interactive multiple-release workflow completes with findings'
+    Assert-True ($interactive.Output -match 'Invalid release:' -and $interactive.Output -match 'Invalid master:') 'Interactive validation re-prompts for bad input'
+    Assert-True ($interactive.Output -match [regex]::Escape('Selected master: ' + (Join-Path $interactiveRoot 'sql\master.sql'))) 'Master selected by number, not default first SQL file'
+    Assert-True ($interactive.Output -match [regex]::Escape('Selected master: ' + (Join-Path $manualRoot 'manual\chosen.sql'))) 'Manual selection outside sql directory accepted within release'
+    Assert-True ($interactive.Output -match 'Releases checked: 2' -and $interactive.Output -notmatch 'COULD NOT CHECK|Some content or calls could not be checked') 'Interactive releases have separate completed results in one summary'
+    Assert-True ($interactive.Output -match [regex]::Escape('Added release: ' + $interactiveRoot)) 'Accepted folder is visibly acknowledged'
+    Assert-Equal @([regex]::Matches($interactive.Output, 'Already added:')).Count 2 'Duplicate entries are acknowledged and not added twice'
+    # ConsoleHost does not emit Read-Host prompt text when stdin is redirected.
+    Assert-True ($interactive.Output -match 'Press Enter on the empty prompt to continue to master selection') 'Accepted and duplicate inputs explain how to advance'
+    Assert-True ($interactive.Output -match 'Releases selected: 2\. Next, confirm or select a master for each release\.') 'Blank input advances to master selection with the correct release count'
+    $autoRoot = New-TestRelease 'Auto master hotfix' '-- Decoy master, not the detected master.' @{
+        'sql\AUTO MASTER HOTFIX.SQL' = '@payload.pb';
+        'sql\payload.pb' = 'select 1 from dual;';
+        'manual\chosen.sql' = '@@leaf.sql'; 'manual\leaf.sql' = 'select 2 from dual;'
+    }
+    $autoMaster = (Get-Item -LiteralPath (Join-Path $autoRoot 'sql\Auto master hotfix.sql')).FullName
+    $acceptedAuto = Run-Interactive $checker @($autoRoot, '', '', 'maybe', ' y ') 'auto-confirm' -VerifyKeepOpen
+    Assert-True $acceptedAuto.HeldForClose 'Confirmed automatic master retains the final interactive wait'
+    Assert-Equal $acceptedAuto.ExitCode 1 'Confirmed automatic master preserves coverage result'
+    Assert-True ($acceptedAuto.Output -match [regex]::Escape('Detected master: ' + $autoMaster)) 'Folder-name master is detected ignoring case and with spaces'
+    Assert-True ($acceptedAuto.Output -match 'the master script for this hotfix\? \(Y/N\)') 'Detected master requires an explicit confirmation'
+    Assert-Equal @([regex]::Matches($acceptedAuto.Output, 'Please enter Y or N\.')).Count 2 'Blank and invalid answers do not accept the master'
+    Assert-True ($acceptedAuto.Output -match [regex]::Escape('Selected master: ' + $autoMaster) -and $acceptedAuto.Output -notmatch 'Select the master for:') 'Y uses the detected master without displaying the selection menu'
+    Assert-True ($acceptedAuto.Output -match 'Files called by master: 1') 'Confirmed master is actually read for file coverage'
+    $rejectedAuto = Run-Interactive $checker @($autoRoot, '', 'n', 'M', 'manual\chosen.sql') 'auto-reject'
+    Assert-Equal $rejectedAuto.ExitCode 1 'Manual choice after N preserves coverage result'
+    Assert-True ($rejectedAuto.Output -match 'Select the master for:' -and $rejectedAuto.Output -match [regex]::Escape('Selected master: ' + (Join-Path $autoRoot 'manual\chosen.sql'))) 'N opens the menu and honors a manually entered master'
+    Assert-True ($interactive.Output -match 'No master matching the release folder name was found') 'Missing folder-name master falls back to the existing menu'
+    $launchCopy = Join-Path $work 'Double click utility'
+    [void](New-Item -ItemType Directory -Path $launchCopy)
+    Copy-Item -LiteralPath $checker, $launcher -Destination $launchCopy
+    $paused = Run-Interactive (Join-Path $launchCopy 'Check-Release.bat') @((Join-Path $fixtures 'Clean'), '', '2', 'x') 'double-click' $true
+    Assert-Equal $paused.ExitCode 0 'No-argument BAT run completes and preserves result'
+    Assert-True ($paused.Output -match 'Press any key to continue') 'Double-click launcher displays pause prompt'
+    Assert-True ($paused.Output -notmatch 'Press Enter to close this window') 'BAT owns its pause without a second script pause'
+    $doubleClickReports = @(Get-ChildItem -LiteralPath (Join-Path $launchCopy 'reports') -Recurse -File)
+    Assert-Equal $doubleClickReports.Count 1 'Double-click launcher saves exactly one summary TXT'
+    Assert-True ($paused.Output.Contains((Get-Content -Raw -LiteralPath $doubleClickReports[0].FullName).TrimEnd())) 'Double-click CMD displays the saved summary'
+    $menu20Files = @{ 'sql\payload.pb' = 'select 1 from dual;' }
+    for ($menuIndex = 1; $menuIndex -le 19; $menuIndex++) {
+        $menu20Files[('sql\00-{0:D2}.sql' -f $menuIndex)] = '-- Other SQL file, not the selected master.'
+    }
+    $menu20Root = New-TestRelease 'Menu twenty' "SET DEFINE ON`nstart payload.pb" $menu20Files
+    $selection20 = Run-Interactive $checker @($menu20Root, '', '20') 'selection20' -VerifyKeepOpen
+    Assert-True $selection20.HeldForClose 'Direct PowerShell launch stays alive after selecting master 20'
+    Assert-Equal $selection20.ExitCode 1 'Selecting master 20 completes and preserves findings status'
+    Assert-True ($selection20.Output -match [regex]::Escape('Selected master: ' + (Join-Path $menu20Root 'sql\master.sql'))) 'Master 20 is selected correctly'
+    Assert-True ($selection20.Output -match 'Files called by master: 1') 'Standard DEFINE ON in master 20 does not erase direct matches'
+    $failedInteractive = Run-Interactive $checker @((Join-Path $fixtures 'Clean'), '', '2') 'failed-interactive' -VerifyKeepOpen -ReportOverride $badReport
+    Assert-True $failedInteractive.HeldForClose 'An unexpected interactive failure remains visible until Enter'
+    Assert-Equal $failedInteractive.ExitCode 2 'Interactive failure preserves exit two after the wait'
+    Assert-True ($failedInteractive.Output -match 'INCOMPLETE / FAILED:.*ReportDirectory must be outside') 'Interactive failure explains its actual cause'
+    $noWait = Run-Interactive $checker @((Join-Path $fixtures 'Clean'), '', '2') 'no-pause' -NoFinalPause
+    Assert-Equal $noWait.ExitCode 0 'Explicit NoPause preserves interactive audit result'
+    Assert-True ($noWait.Output -notmatch 'Press Enter to close this window') 'Explicit NoPause disables the final script wait'
+    Assert-Equal (Fixture-Hashes) $before 'All fixture file paths and bytes remain unchanged'
+    Write-Host ("PASS: $script:assertions assertions. Logs/reports: $work")
+    exit 0
+} catch {
+    Write-Host ('FAIL: ' + $_.Exception.Message)
+    Write-Host $_.ScriptStackTrace
+    Write-Host ('Artifacts retained at: ' + $work)
+    exit 1
+}

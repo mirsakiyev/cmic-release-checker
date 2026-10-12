@@ -1,0 +1,1 @@
+-- Semicolon inside a quoted filename remains part of the filename.

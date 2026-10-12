@@ -1,0 +1,1 @@
+-- Mentioned only in ordinary and Oracle alternative SQL literals.

@@ -1,0 +1,1 @@
+-- The checker must not guess this instead of default_name.sql.

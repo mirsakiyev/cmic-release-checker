@@ -1,0 +1,1 @@
+-- Must not be confidently matched when a nested script changes suffix.

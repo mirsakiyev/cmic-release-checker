@@ -1,0 +1,1 @@
+-- Single quoted path fixture.
