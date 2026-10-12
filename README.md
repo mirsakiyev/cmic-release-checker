@@ -16,6 +16,12 @@ Double-click **Check-Release.bat**:
    selection menu appears automatically. Names are matched ignoring case.
 3. Read the result, counts, and list of files with no matching call in the master.
 
+Encoding is automatic by default: Unicode BOMs take precedence; otherwise the
+checker tries strict UTF-8, then Windows-1252 if UTF-8 decoding fails. It does
+not ask an encoding question. Each fallback appears in the summary and applies
+only to that file, so UTF-8 child scripts retain their decoding. Source files
+are never rewritten. Use `-ScriptEncoding UTF8` to require strict UTF-8.
+
 The same summary appears in the CMD window and in **one `summary.txt` file** under
 `reports\<timestamp>` beside the utility. Multiple selected releases are included
 in that one file. The window stays open so you can read the result.
@@ -52,14 +58,23 @@ Windows PowerShell 5.1 is required; no additional tools or modules are needed.
 - Only active `START` (`STA`/`STAR`), `@`, and `@@` calls in the selected master
   count. Comments, quoted SQL literals, and output commands do not count.
 - Names match case-insensitively as whole filenames/paths, including quoted paths
-  with spaces. Extensionless calls assume `.sql`.
+  with spaces. A bare `START`/`@` filename in the master covers every exact-name
+  copy across release folders: `START aperror.dat` covers both `sql\aperror.dat`
+  and `uig\sql\aperror.dat`. The summary notes this filename-presence match;
+  it does not establish which copy SQL*Plus executes. Extensionless calls assume
+  `.sql`.
 - All release files are checked recursively except the selected master and files
   ending in `.ear`, `.java`, `.war`, `.bc`, `.zip`, `.docx`, `.wft`, `.perl`, `.pl`,
-  `.txt`, `.cmd`, `.sh`, `.bat`, or `.undeploy`. These exclusions ignore case.
-- `START`/`@` use the master folder by default; `@@` uses the calling script's
-  folder. `-WorkingDirectory` overrides the `START`/`@` base. An explicit wrong path
-  never falls back to a matching filename. A bare filename can match one unique
-  release file; this does not prove that SQL*Plus will find it at runtime.
+  `.txt`, `.cmd`, `.sh`, `.bat`, `.undeploy`, `.properties`, `.jar`, or `.deploy`. These exclusions ignore case.
+- Calls with explicit paths use exact path matching. `START`/`@` paths use the
+  master folder by default; `@@` uses the calling script's folder.
+  `-WorkingDirectory` overrides the `START`/`@` base. An explicit wrong path never
+  falls back to a matching filename. Nested reads follow the resolved primary
+  path; extra filename copies are not read by guessing their runtime location.
+- Multiline SQL and `EXECUTE IMMEDIATE` literals stay within the SQL parser's
+  quote state. START-looking text inside them never counts, and active calls
+  after the closing quote remain visible. SQL*Plus prompts and control text
+  cannot leave an open SQL literal that hides later calls.
 - Variables, ambiguous filenames, unsupported calls, read errors, and skipped
   links require review. A short note appears when the check is incomplete.
   An uncalled supporting file does not necessarily indicate a deployment error.
@@ -74,8 +89,14 @@ indirectly still have no direct call in the master.
 For multiple releases from CMD, use `-InputCsv inputs.csv` with columns
 `ReleasePath,MasterPath,WorkingDirectory` (the last column is optional).
 PowerShell callers can pass paired arrays to `-ReleasePath` and `-MasterPath`.
-Use `-ScriptEncoding Default` for legacy Windows ANSI scripts; the default is
-strict UTF-8, with Unicode BOM detection. `-NoPause` disables the final wait when
+Use `-ScriptEncoding Default` for legacy Windows ANSI scripts using the laptop's
+active code page. Use `-ScriptEncoding Windows1252` when the source is known to
+use Western Windows-1252, regardless of the laptop's locale. The default
+`-ScriptEncoding Auto` uses the per-file UTF-8/Windows-1252 fallback above in
+both interactive and automated runs. Explicit encoding options apply to every
+no-BOM script; they disable fallback. Unicode BOMs always take precedence, and
+malformed BOM-declared Unicode remains an error.
+`-NoPause` disables the final wait when
 running the PowerShell script interactively. `-Help` lists parameters.
 
 If a mapped drive is slow, use `Check-Release.bat -Verbose` to show each folder

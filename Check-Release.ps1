@@ -17,8 +17,8 @@ param(
     [switch]$DetailedReport,
     [string]$ReportDirectory = '',
     [string]$InputCsv,
-    [ValidateSet('UTF8', 'Default', 'Unicode', 'BigEndianUnicode')]
-    [string]$ScriptEncoding = 'UTF8',
+    [ValidateSet('Auto', 'UTF8', 'Default', 'Windows1252', 'Unicode', 'BigEndianUnicode')]
+    [string]$ScriptEncoding = 'Auto',
     [ValidateRange(1, 1024)][int]$MaxScriptSizeMB = 64,
     [switch]$NonInteractive,
     [switch]$NoPause,
@@ -28,9 +28,9 @@ param(
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 $script:ExcludedExtensions = @('.ear', '.java', '.war', '.bc', '.zip',
-    '.docx', '.wft', '.perl', '.pl', '.txt', '.cmd', '.sh', '.bat', '.undeploy')
+    '.docx', '.wft', '.perl', '.pl', '.txt', '.cmd', '.sh', '.bat', '.undeploy', '.properties', '.jar', '.deploy')
 $script:ReportAudits = @()
-$script:FreeTextCommandPattern = '^\s*(?i:REM(?:A(?:R(?:K)?)?)?|PRO(?:M(?:P(?:T)?)?)?|SPO(?:O(?:L)?)?|DEF(?:I(?:N(?:E)?)?)?|UNDEF\w*|ACC(?:E(?:P(?:T)?)?)?|COL(?:U(?:M(?:N)?)?)?|TTI\w*|BTI\w*)(?:\s|$)'
+$script:FreeTextCommandPattern = '^\s*(?i:REM(?:A(?:R(?:K)?)?)?|PRO(?:M(?:P(?:T)?)?)?|PAU(?:S(?:E)?)?|SPO(?:O(?:L)?)?|DEF(?:I(?:N(?:E)?)?)?|UNDEF\w*|ACC(?:E(?:P(?:T)?)?)?|COL(?:U(?:M(?:N)?)?)?|TTI\w*|BTI\w*)(?:\s|$)'
 
 function New-PathMap { return [Collections.Hashtable]::new([StringComparer]::OrdinalIgnoreCase) }
 function Test-SamePath([string]$Left, [string]$Right) { return [string]::Equals($Left, $Right, [StringComparison]::OrdinalIgnoreCase) }
@@ -255,12 +255,18 @@ function Get-CodeLine([string]$Line, $State) {
             continue
         }
         if ($c -eq '-' -and $next -eq '-') { break }
-        if ($c -eq '/' -and $next -eq '*') { $State.Block = $true; [void]$out.Append('  '); $i++; continue }
+        if ($c -eq '/' -and $next -eq '*') { $State.Block = $true; $State.BlockLine = [int]$State['Line']; [void]$out.Append('  '); $i++; continue }
         if (-not $hasToken -and -not [char]::IsWhiteSpace($c)) {
             $rest = $Line.Substring($i)
             # These SQL*Plus commands contain free text, not SQL string literals.
             if ($rest -match $script:FreeTextCommandPattern) {
                 return [pscustomobject]@{ Text = ''; StartedInLiteral = $startedInLiteral }
+            }
+            # SQL*Plus control-command arguments are not multiline SQL literals.
+            # Keep SET text for settings analysis without letting prompt/password
+            # punctuation consume subsequent START lines.
+            if ($rest -match '^(?i:SET)\s+(?i:SQLP(?:R(?:O(?:M(?:P(?:T)?)?)?)?)?|PAU(?:S(?:E)?)?)(?:\s|$)|^(?i:CONN(?:E(?:C(?:T)?)?)?)\s+(?![Bb][Yy](?:\s|$))|^(?i:SHO(?:W)?|WHENEVER|CL(?:E(?:A(?:R)?)?)?|PRI(?:N(?:T)?)?|PASSW(?:O(?:R(?:D)?)?)?|HELP)(?:\s|$)') {
+                return [pscustomobject]@{ Text = $out.ToString() + $rest; StartedInLiteral = $startedInLiteral }
             }
             $hasToken = $true
         }
@@ -268,9 +274,10 @@ function Get-CodeLine([string]$Line, $State) {
             $delimiter = [string]$Line[$i + 2]
             $pairs = @{ '[' = ']'; '(' = ')'; '{' = '}'; '<' = '>' }
             $State.AlternateEnd = if ($pairs.ContainsKey($delimiter)) { $pairs[$delimiter] } else { $delimiter }
+            $State.AlternateLine = [int]$State['Line']
             [void]$out.Append($Line.Substring($i, 3)); $i += 2; continue
         }
-        if ($c -eq "'" -or $c -eq '"') { $State.Quote = [string]$c }
+        if ($c -eq "'" -or $c -eq '"') { $State.Quote = [string]$c; $State.QuoteLine = [int]$State['Line'] }
         [void]$out.Append($c)
     }
     return [pscustomobject]@{ Text = $out.ToString(); StartedInLiteral = $startedInLiteral }
@@ -316,14 +323,14 @@ function Read-Target([string]$Operand) {
 function Read-Script([string]$Path, $Audit = $null) {
     $calls = New-Object System.Collections.ArrayList
     $issues = New-Object System.Collections.ArrayList
-    $suffixUnknown = $false; $syntaxUnknown = $false; $readSucceeded = $false
-    $state = @{ Block = $false; Quote = ''; AlternateEnd = '' }
+    $suffixUnknown = $false; $syntaxUnknown = $false; $readSucceeded = $false; $errorLine = 0
+    $state = @{ Block = $false; Quote = ''; AlternateEnd = ''; Line = 0; BlockLine = 0; QuoteLine = 0; AlternateLine = 0 }
     try {
         Update-AuditProgress $Audit ('Reading script: ' + $Path)
         # Decode the complete byte array: .NET Framework StreamReader can drop
         # an incomplete UTF-8 sequence at EOF without flushing its decoder.
         $bytes = Read-ScriptBytes $Path
-        $codePage = @{ UTF8 = 65001; Default = [Text.Encoding]::Default.CodePage; Unicode = 1200; BigEndianUnicode = 1201 }[$ScriptEncoding]
+        $codePage = @{ Auto = 65001; UTF8 = 65001; Default = [Text.Encoding]::Default.CodePage; Windows1252 = 1252; Unicode = 1200; BigEndianUnicode = 1201 }[$ScriptEncoding]
         $offset = 0
         foreach ($bom in @(@('FF-FE-00-00', 12000, 4), @('00-00-FE-FF', 12001, 4),
             @('EF-BB-BF', 65001, 3), @('FF-FE', 1200, 2), @('FE-FF', 1201, 2))) {
@@ -332,12 +339,29 @@ function Read-Script([string]$Path, $Audit = $null) {
             }
         }
         $encoding = [Text.Encoding]::GetEncoding($codePage, [Text.EncoderFallback]::ExceptionFallback, [Text.DecoderFallback]::ExceptionFallback)
-        $text = $encoding.GetString($bytes, $offset, $bytes.Length - $offset)
+        try { $text = $encoding.GetString($bytes, $offset, $bytes.Length - $offset) }
+        catch {
+            $decodeError = $_.Exception.GetBaseException()
+            if ($decodeError -isnot [Text.DecoderFallbackException]) { throw }
+            if ($offset -eq 0 -and $ScriptEncoding -eq 'Auto') {
+                $encoding = [Text.Encoding]::GetEncoding(1252, [Text.EncoderFallback]::ExceptionFallback, [Text.DecoderFallback]::ExceptionFallback)
+                $text = $encoding.GetString($bytes, 0, $bytes.Length)
+                if ($Audit) { [void]$Audit.EncodingFallbacks.Add([pscustomobject]@{ SourceFile = $Path; Encoding = 'Windows1252' }) }
+                Update-AuditProgress $Audit ('Reading as Windows1252 after invalid UTF-8: ' + $Path) -Force
+            } else {
+                $message = 'Encoding error (' + $encoding.WebName + '): ' + $decodeError.Message
+                if ($offset -eq 0 -and $codePage -eq 65001) {
+                    $message += ' If this is a legacy Windows ANSI script, rerun Check-Release.bat -ScriptEncoding Default; use -ScriptEncoding Windows1252 for a known Western Windows-1252 file. No encoding was guessed and no source was changed.'
+                } else { $message += ' Check the file encoding; a Unicode BOM overrides -ScriptEncoding.' }
+                throw $message
+            }
+        }
         if ($text.IndexOf([char]0) -ge 0) { throw 'Binary/NUL content is not a supported SQL*Plus text script.' }
         $lines = [regex]::Split($text, '\r\n|\n|\r')
         $readSucceeded = $true
         for ($n = 0; $n -lt $lines.Length; $n++) {
             if ($n % 256 -eq 0) { Update-AuditProgress $Audit ('Parsing ' + [IO.Path]::GetFileName($Path) + ': line ' + ($n + 1) + ' of ' + $lines.Length) }
+            $state.Line = $n + 1
             $code = Get-CodeLine $lines[$n] $state
             if ($code.StartedInLiteral) { continue }
             $line = $code.Text.Trim()
@@ -368,6 +392,10 @@ function Read-Script([string]$Path, $Audit = $null) {
                 [void]$issues.Add([pscustomobject]@{ SourceFile = $Path; LineNumber = $n + 1;
                     Message = 'Parser/substitution setting is not modeled; supported calls require manual review.'; SourceText = $lines[$n] })
             }
+            elseif ($line -match '^(?i:EXECUTE)\s+(?i:IMMEDIATE)(?:\s|$)') {
+                # PL/SQL dynamic SQL can contain a multiline literal. It is not
+                # a SQL*Plus EXECUTE command; preserve its lexer state.
+            }
             elseif ($line -match '^(?i:GET|RUN|R|EXEC(?:U(?:T(?:E)?)?)?|SQLPLUS)(?:\s|$)|^(?i:CALL|:R)\s|^#!|^(?i:@echo|param\s*\(|function\s|Import-Module\s|Write-Host\s)') {
                 $command = 'UNSUPPORTED'; $operand = $line
             }
@@ -384,10 +412,12 @@ function Read-Script([string]$Path, $Audit = $null) {
             }
         }
         if ($state.Block -or $state.Quote -ne '' -or $state.AlternateEnd -ne '') {
-            throw 'Unterminated block comment or SQL literal; analysis may be incomplete.'
+            $kind = if ($state.Block) { 'block comment' } else { 'SQL literal' }
+            $errorLine = if ($state.Block) { $state.BlockLine } elseif ($state.AlternateEnd -ne '') { $state.AlternateLine } else { $state.QuoteLine }
+            throw ('Unterminated ' + $kind + ' opened at line ' + $errorLine + '; analysis may be incomplete. Source: ' + $lines[$errorLine - 1])
         }
     } catch {
-        [void]$issues.Add([pscustomobject]@{ SourceFile = $Path; LineNumber = 0;
+        [void]$issues.Add([pscustomobject]@{ SourceFile = $Path; LineNumber = $errorLine;
             Message = "Script read/parse error: $($_.Exception.Message)"; SourceText = '' })
     }
     return [pscustomobject]@{ Calls = @($calls); Issues = @($issues);
@@ -478,19 +508,46 @@ function Visit-Script($Audit, [string]$Path, [string[]]$Stack, [string]$Chain) {
     $stackNow = @($Stack) + @($Path)
     foreach ($call in $parsed.Calls) {
         $edgeChain = $Chain + ':' + $call.LineNumber + ' -> ' + $call.Target
-        $reference = Resolve-Call $call $Audit $edgeChain (Test-SamePath $Path $Audit.Master)
-        [void]$Audit.References.Add($reference)
-        if ($Audit.Nested -and $reference.Status -eq 'Resolved') {
-            if (@($stackNow | Where-Object { Test-SamePath $_ $reference.ResolvedPath }).Count) {
-                $reference.Cycle = $true; $reference.Notes += ' Cycle detected; traversal stopped at this edge.'
-            } else {
-                # SQL*Plus can read any extension. Recognize foreign languages
-                # conservatively and report them rather than parsing them as SQL.
-                $extension = [IO.Path]::GetExtension($reference.ResolvedPath)
-                if ($script:ExcludedExtensions -contains $extension -or
-                    @('.bat', '.cmd', '.ps1', '.exe', '.dll', '.png', '.jpg', '.pdf', '.sh', '.py') -contains $extension) {
-                    Add-Issue $Audit 'Reached content type is unsupported for nested SQL*Plus parsing.' $reference.ResolvedPath
-                } else { Visit-Script $Audit $reference.ResolvedPath $stackNow ($Chain + ':' + $call.LineNumber + ' -> ' + (Get-RelativePath $reference.ResolvedPath $Audit.Root)) }
+        $primary = Resolve-Call $call $Audit $edgeChain (Test-SamePath $Path $Audit.Master)
+        $references = @($primary)
+        # Direct coverage asks whether the filename is called by the master.
+        # Bare START/@ names cover every exact basename in the release. Explicit
+        # paths and @@ keep path resolution; nested reads use only the primary.
+        if ($primary.Direct -and $call.Command -ne '@@' -and $call.Target -notmatch '[\\/:]' -and
+            $primary.Status -in @('Resolved', 'Ambiguous')) {
+            $name = $call.Target
+            if (-not [IO.Path]::GetExtension($name)) { $name += '.sql' }
+            $copies = @($Audit.ByName[$name])
+            if ($copies.Count -gt 1) {
+                $references = foreach ($copy in $copies) {
+                    $match = $primary.PSObject.Copy()
+                    $match.ResolvedPath = $copy.FullPath
+                    $match.Status = if ($copy.IsLink) { 'Unresolved' } else { 'Resolved' }
+                    $match.MatchingMethod = 'FilenamePresence'
+                    $match.Candidates = $copies.FullPath -join ' | '
+                    $match.Notes = 'Exact filename called in the master; multiple release copies match. This does not establish which copy SQL*Plus executes.'
+                    $match
+                }
+                if ($Audit.Nested -and $primary.Status -ne 'Resolved') {
+                    Add-Issue $Audit 'Multiple filename copies match; the nested script path is ambiguous and was not read.' $Path $call.LineNumber $call.SourceText
+                }
+            }
+        }
+        foreach ($reference in $references) {
+            [void]$Audit.References.Add($reference)
+            if ($Audit.Nested -and $primary.Status -eq 'Resolved' -and $reference.Status -eq 'Resolved' -and
+                (Test-SamePath $reference.ResolvedPath $primary.ResolvedPath)) {
+                if (@($stackNow | Where-Object { Test-SamePath $_ $reference.ResolvedPath }).Count) {
+                    $reference.Cycle = $true; $reference.Notes += ' Cycle detected; traversal stopped at this edge.'
+                } else {
+                    # SQL*Plus can read any extension. Recognize foreign languages
+                    # conservatively and report them rather than parsing them as SQL.
+                    $extension = [IO.Path]::GetExtension($reference.ResolvedPath)
+                    if ($script:ExcludedExtensions -contains $extension -or
+                        @('.bat', '.cmd', '.ps1', '.exe', '.dll', '.png', '.jpg', '.pdf', '.sh', '.py') -contains $extension) {
+                        Add-Issue $Audit 'Reached content type is unsupported for nested SQL*Plus parsing.' $reference.ResolvedPath
+                    } else { Visit-Script $Audit $reference.ResolvedPath $stackNow ($Chain + ':' + $call.LineNumber + ' -> ' + (Get-RelativePath $reference.ResolvedPath $Audit.Root)) }
+                }
             }
         }
     }
@@ -507,6 +564,7 @@ function New-Audit([string]$Root, [string]$Master, [string]$Working, [bool]$Nest
         ExitCode = 2; Counts = @{}; Summary = ''; ReportPaths = @(); Repeated = @(); MasterReadable = $false
         InputError = ''; NormalizedRoot = $true
         ShowProgress = $false; ProgressWatch = [Diagnostics.Stopwatch]::StartNew()
+        EncodingFallbacks = (New-Object System.Collections.ArrayList)
     }
 }
 
@@ -615,6 +673,12 @@ function Get-CoverageSummary($Audit) {
     $s = New-Object 'System.Collections.Generic.List[string]'
     $s.Add('Release: ' + (ConvertTo-SafeText $Audit.Root))
     $s.Add('Selected master: ' + (ConvertTo-SafeText $Audit.Master))
+    foreach ($choice in $Audit.EncodingFallbacks) {
+        $s.Add('Encoding fallback: ' + (ConvertTo-SafeText (Get-RelativePath $choice.SourceFile $Audit.Root)) + ' read as ' + $choice.Encoding + ' after invalid UTF-8.')
+    }
+    if (@($Audit.References | Where-Object { $_.MatchingMethod -eq 'FilenamePresence' }).Count) {
+        $s.Add('Matching: Bare filenames called in the master cover all exact-name copies across release folders; runtime path selection is not verified.')
+    }
     if (-not $Audit.MasterReadable) {
         $s.Add('Result: COULD NOT CHECK - the release or master could not be read.')
         if ($Audit.Issues.Count) { $s.Add('Reason: ' + (ConvertTo-SafeText $Audit.Issues[0].Message)) }
@@ -656,6 +720,10 @@ function Get-Summary($Audit) {
     $s.Add('Mode: ' + $(if ($Audit.Nested) { 'Direct and reachable nested calls' } else { 'Direct master calls only' }))
     $s.Add('Assumed working directory (START/@): ' + (ConvertTo-SafeText $Audit.WorkingDirectory))
     $s.Add('Script encoding without BOM: ' + $Audit.Encoding + ' (Unicode BOM overrides).')
+    foreach ($choice in $Audit.EncodingFallbacks) {
+        $s.Add('Automatic per-file encoding fallback: ' + (ConvertTo-SafeText $choice.SourceFile) + ' = ' + $choice.Encoding)
+    }
+    $s.Add('Bare START/@ filenames in the master cover all exact-name copies; explicit paths and @@ remain path-based. Nested reads use only the resolved primary path.')
     $s.Add('@@ resolves relative to its caller. Default suffix: .sql unless flagged as unknown.')
     $s.Add('UniqueFilename is an inventory match, not proof of runtime lookup. SQLPATH is not searched.')
     foreach ($entry in $Audit.Counts.GetEnumerator()) {
@@ -784,7 +852,7 @@ function Invoke-Checker {
         Write-Console '            [-IncludeNested] [-ReportDirectory <path>] [-NonInteractive]'
         Write-Console '            [-DetailedReport] (optional CSVs and full call details)'
         Write-Console '            [-NoPause] (disable the final wait in an interactive script run)'
-        Write-Console '            [-ScriptEncoding UTF8|Default|Unicode|BigEndianUnicode] [-MaxScriptSizeMB 64]'
+        Write-Console '            [-ScriptEncoding Auto|UTF8|Default|Windows1252|Unicode|BigEndianUnicode] [-MaxScriptSizeMB 64]'
         Write-Console 'Alternative batch input: -InputCsv <csv> with ReleasePath,MasterPath,WorkingDirectory columns.'
         Write-Console 'See README.md for examples and exit codes (0 / 1 / 2).'
         return 0

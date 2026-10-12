@@ -29,7 +29,7 @@ evaluated as PowerShell, SQL, shell commands, variables, or expressions.
 
 ## Review and verification
 
-- All **612 assertions passed** under Windows PowerShell 5.1, including the 601
+- All **712 assertions passed** under Windows PowerShell 5.1, including the 601
   original security-review assertions. Existing parser,
   matching, reports, encoding, error handling, nested traversal, and interactive
   behavior cases were retained alongside the security regressions.
@@ -63,11 +63,11 @@ One strict encoding/BOM table replaces separate decoder construction branches.
 Common report writers centralize text escaping and safe file creation. The CMD
 launcher is **8 lines instead of 11**, retaining its single interactive pause.
 
-The PowerShell source is **958 lines instead of 842**, including the mapped-drive
-follow-up below. Removed duplication was
+The PowerShell source is **1026 lines instead of 842**, including the mapped-drive
+and encoding follow-ups below. Removed duplication was
 offset by the added security protections. No lexer, resolution, validation,
 read-only safeguard, or established feature was removed to force a smaller
-source file. Master detection, all 14 exclusions, one default TXT for multiple
+source file. Master detection, all 17 exclusions, one default TXT for multiple
 releases, optional detailed reports, and optional nested checking are preserved.
 
 Detailed CSV consumers must account for the new visible `text:` prefix on
@@ -119,6 +119,58 @@ call detected. These are local measurements, not live network benchmarks or
 performance guarantees. The 612-assertion suite and real-hotfix comparison
 passed; real release files retained their hashes and coverage results.
 
+## Legacy encoding follow-up
+
+After the mapped-drive scan completed, a work master failed strict UTF-8 decoding
+on byte A0. A legacy ANSI encoding is a possible cause; the file's actual encoding
+was not inferred automatically. `-ScriptEncoding Default` already selects the
+Windows PowerShell host's active code page. `-ScriptEncoding Windows1252` now
+provides an explicit Western Windows-1252 choice independent of that locale.
+
+The earlier interactive encoding confirmation has been replaced at the user's
+request. The default is now `Auto`: strict UTF-8 first, with Windows-1252 fallback
+only for a no-BOM file that fails UTF-8 decoding. Both interactive and automated
+runs continue without an encoding question. Every fallback is recorded in the
+summary, applies only to that file, and leaves UTF-8 child decoding unchanged.
+Explicit `-ScriptEncoding UTF8` retains strict rejection without fallback.
+
+Malformed BOM content still reports an error without an ANSI retry, BOMs still
+take precedence, binary/NUL rejection remains enabled, and no source bytes are
+changed. Tests reproduce an A0-bearing master around the reported offset,
+preserve accented filenames and a UTF-8 child, and verify calls after the byte.
+Actual PowerShell and CMD processes cover automatic fallback, strict decoding,
+the final pause, and console/TXT agreement. The real-hotfix coverage
+and source hashes remain unchanged.
+
+## Master coverage and multiline SQL follow-up
+
+The supplied TOR-21 master reproduced a parser defect: multiline PL/SQL `EXECUTE
+IMMEDIATE` was classified as a one-line SQL*Plus invocation, and its quote state
+was reset. Closing literal quotes then opened false literals and hid later calls.
+Dynamic SQL now retains its multiline quote state, while embedded START-looking
+text stays excluded. SQL*Plus PAUSE and control text no longer create SQL literal
+state from prompt or credential punctuation. Genuine unterminated comments and
+literals identify their opening line and source.
+
+For the user's filename-coverage requirement, a bare START/@ filename in the
+master now covers every ordinal, case-insensitive exact basename in the release.
+This explicitly includes copies in `sql` and `uig\sql`. Reports identify these
+as filename-presence matches; this is not proof that every copy executes.
+Explicit paths, @@ caller-relative paths, Unicode lookalikes, variables, links,
+and unsupported syntax retain their guards. Nested traversal reads only the
+resolved primary path and reports an ambiguous nested path rather than reading
+extra copies by guessing.
+
+The user's 4,807-line TOR master now parses with zero lexer errors and 195 START
+calls. A local 171-file inventory replica built from the supplied report and
+placeholder file contents reproduced 1 matched / 105 uncalled before the fix,
+then 53 matched / 53 uncalled afterward. The old and new runs both retained
+incomplete status for unsupported invocations; the false unterminated-literal
+reason disappeared. Replica source hashes and console/TXT agreement were verified.
+This validates the supplied master text and filename inventory, not the actual
+network files or their raw encodings. The real local hotfix still reports
+53 checked / 25 called / 28 uncalled with unchanged source hashes.
+
 ## Primary references
 
 - [OWASP: CSV Injection](https://community.owasp.org/attacks/CSV_Injection)
@@ -133,3 +185,10 @@ passed; real release files retained their hashes and coverage results.
 - [PowerShell provider source](https://github.com/PowerShell/PowerShell/blob/v6.0.0/src/System.Management.Automation/namespaces/FileSystemProvider.cs#L7393)
   shows the Windows metadata and hardlink queries behind link properties in the
   .NET Framework implementation.
+- [Microsoft: Encoding.Default](https://learn.microsoft.com/en-us/dotnet/api/system.text.encoding.default?view=netframework-4.8.1)
+  documents the active-code-page behavior of .NET Framework and its dependence
+  on machine configuration.
+- [Oracle: EXECUTE IMMEDIATE](https://docs.oracle.com/en/database/oracle/oracle-database/19/lnpls/EXECUTE-IMMEDIATE-statement.html)
+  documents the PL/SQL statement for dynamic SQL.
+- [Oracle: PAUSE](https://docs.oracle.com/en/database/oracle/oracle-database/21/sqpug/PAUSE.html)
+  documents SQL*Plus message text rather than a SQL literal.

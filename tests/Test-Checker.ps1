@@ -9,6 +9,7 @@ $fixtures = Join-Path $testRoot 'fixtures'
 $work = Join-Path $testRoot ('.work\' + (Get-Date -Format 'yyyyMMdd_HHmmss') + '_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
 [void](New-Item -ItemType Directory -Path $work -Force)
 $script:assertions = 0
+$script:childConsoleEncoding = $null
 
 function Assert-Equal($Actual, $Expected, [string]$Message) {
     $script:assertions++
@@ -63,10 +64,27 @@ function Fixture-Hashes {
     })) -join "`n"
 }
 function Run-Interactive([string]$Entry, [string[]]$InputLines, [string]$Name, [bool]$Batch = $false,
-    [switch]$VerifyKeepOpen, [string]$ReportOverride = '', [switch]$NoFinalPause) {
+    [switch]$VerifyKeepOpen, [string]$ReportOverride = '', [switch]$NoFinalPause, [switch]$Nested, [switch]$Detailed, [switch]$StrictUtf8) {
+    if (-not $script:childConsoleEncoding) {
+        # A windowless Windows PowerShell child can use an OEM code page even
+        # when the parent console is UTF-8. Read its actual setting once so
+        # redirected output preserves accented filenames in the assertions.
+        $probeInfo = New-Object Diagnostics.ProcessStartInfo
+        $probeInfo.FileName = (Get-Command powershell.exe).Source
+        $probeInfo.Arguments = '-NoProfile -Command "[Console]::OutputEncoding.CodePage"'
+        $probeInfo.UseShellExecute = $false; $probeInfo.CreateNoWindow = $true; $probeInfo.RedirectStandardOutput = $true
+        $probe = [Diagnostics.Process]::Start($probeInfo)
+        try {
+            $codePage = $probe.StandardOutput.ReadToEnd().Trim()
+            $probe.WaitForExit()
+            if ($probe.ExitCode -ne 0) { throw 'Could not determine the child console encoding.' }
+            $script:childConsoleEncoding = [Text.Encoding]::GetEncoding([int]$codePage)
+        } finally { $probe.Dispose() }
+    }
     $info = New-Object Diagnostics.ProcessStartInfo
     $info.UseShellExecute = $false; $info.CreateNoWindow = $true
     $info.RedirectStandardInput = $true; $info.RedirectStandardOutput = $true; $info.RedirectStandardError = $true
+    $info.StandardOutputEncoding = $script:childConsoleEncoding; $info.StandardErrorEncoding = $script:childConsoleEncoding
     if ($Batch) {
         $info.FileName = $env:ComSpec
         $info.Arguments = '/d /c ""' + $Entry + '""'
@@ -75,6 +93,9 @@ function Run-Interactive([string]$Entry, [string[]]$InputLines, [string]$Name, [
         $reportPath = if ($ReportOverride) { $ReportOverride } else { Join-Path $work ($Name + '-reports') }
         $info.Arguments = '-NoProfile -ExecutionPolicy Bypass -File "' + $Entry + '" -ReportDirectory "' + $reportPath + '"'
         if ($NoFinalPause) { $info.Arguments += ' -NoPause' }
+        if ($Nested) { $info.Arguments += ' -IncludeNested' }
+        if ($Detailed) { $info.Arguments += ' -DetailedReport' }
+        if ($StrictUtf8) { $info.Arguments += ' -ScriptEncoding UTF8' }
     }
     $process = New-Object Diagnostics.Process
     $process.StartInfo = $info
@@ -129,7 +150,7 @@ try {
         Assert-Equal @($audit.Files | Where-Object { $_.Excluded }).Count 8 'Configured excluded extensions, mixed case'
         Assert-Equal $audit.Rows.Count 27 'Master excluded, every other eligible file retained'
         Assert-Equal $audit.ExitCode 2 'Unresolved variable makes the audit incomplete'
-        Assert-Equal $audit.Issues.Count 0 'Fixture text reads and lexes correctly'
+        Assert-Equal $audit.Issues.Count $(if ($nested) { 1 } else { 0 }) 'Nested ambiguous copies are not read by guessing their location'
         foreach ($e in $expected) {
             $row = Row $audit $e.RelativeFilePath
             Assert-Equal $row.DirectReferenceStatus $e.DirectReferenceStatus "Direct status: $($e.RelativeFilePath)"
@@ -140,7 +161,7 @@ try {
             Assert-Equal $row.MatchingMethod $method "Matching method: $($e.RelativeFilePath)"
             Assert-Equal $row.AuditStatus 'Incomplete' 'CSV rows signal provisional coverage'
         }
-        Assert-Equal @($audit.References | Where-Object { $_.Status -eq 'Ambiguous' }).Count 1 'One duplicate-filename ambiguity'
+        Assert-Equal @($audit.References | Where-Object { $_.Status -eq 'Ambiguous' }).Count 0 'Direct bare filenames cover exact copies across release folders'
         Assert-Equal @($audit.References | Where-Object { $_.Status -eq 'MissingInRelease' }).Count 2 'Wrong explicit path and missing call both reported'
         Assert-Equal @($audit.References | Where-Object { $_.Target -eq 'wrong\py_post.pb' -and $_.Status -eq 'MissingInRelease' }).Count 1 'Wrong path cannot use basename fallback'
         Assert-Equal @($audit.References | Where-Object { $_.LineNumber -eq 18 -and $_.Target -eq 'py_post.pb' }).Count 1 'Original source line retained'
@@ -148,12 +169,12 @@ try {
         Assert-Equal $quoted.Arguments 'argument1 "argument two"' 'Arguments are separate from quoted target'
         Assert-True ((Row $audit 'docs\unique.DATA').Notes -match 'runtime SQL\*Plus lookup is not established') 'Unique filename caveat appears in CSV'
         Assert-Equal @($audit.References | Where-Object { $_.Cycle }).Count $(if ($nested) { 1 } else { 0 }) 'Cycle detection stops recursion'
-        Assert-Equal $audit.Repeated.Count $(if ($nested) { 3 } else { 2 }) 'Repeated static calls grouped per target'
+        Assert-Equal $audit.Repeated.Count $(if ($nested) { 4 } else { 3 }) 'Repeated static calls grouped per matching release file'
         Assert-Equal @($audit.References | Where-Object { $_.SourceFile -like '*unrelated.sql' }).Count 0 'Unrelated scripts never contribute coverage'
         if ($nested) {
             $indirect = Row $audit 'sql\subfolder\indirect.sql'
             Assert-True ($indirect.CallChains -match 'master.sql:22 -> sql\\subfolder\\post_install.sql:1') 'Indirect chain contains master and caller lines'
-            Assert-True ((Get-Summary $audit) -match 'Files not directly referenced: 14') 'Indirectly called file remains in not-direct total'
+            Assert-True ((Get-Summary $audit) -match 'Files not directly referenced: 11') 'Indirectly called file remains in not-direct total'
         }
     }
     Assert-Equal (Audit-Fixture 'Clean').ExitCode 0 'Clean fixture exit zero'
@@ -210,8 +231,53 @@ try {
     Assert-True ($extensionlessAudit.References[0].ResolvedPath.EndsWith('payload.sql')) 'Missing extensionless target records assumed .sql path'
     $freeText = New-TestRelease 'FreeText' "REM q'[`nPROMPT 'never closed`nSPOOL Bob's.log`n@child.sql" @{ 'sql\child.sql' = 'select 1 from dual;' }
     Assert-Equal (Audit-Path $freeText).ExitCode 0 'Free-text comments/logging quotes do not hide calls'
+    $controlText = New-TestRelease 'Control text' "@first.sql`nPAUSE Don't continue before checking the backup`nSET SQLPROMPT Developer's DB>`nCONNECT user/secret'@database`nSTART second.pb`nselect 'multiline SQL:`nSTART decoy.pb`n' from dual;`nselect q'[alternate SQL:`n@decoy.pb`n]' from dual;`n-- START decoy.pb`n/* START decoy.pb */" @{
+        'sql\first.sql' = 'select 1 from dual;'; 'sql\second.pb' = 'select 2 from dual;'; 'sql\decoy.pb' = 'select 3 from dual;'
+    }
+    $controlAudit = Audit-Path $controlText
+    Assert-Equal $controlAudit.Issues.Count 0 'SQL*Plus free text cannot poison subsequent SQL literal state'
+    Assert-Equal (Row $controlAudit 'sql\first.sql').DirectCallCount 1 'Early master call remains visible before control text'
+    Assert-Equal (Row $controlAudit 'sql\second.pb').DirectCallCount 1 'START after unpaired control-text punctuation is detected'
+    Assert-Equal (Row $controlAudit 'sql\decoy.pb').DirectCallCount 0 'Real SQL strings, alternate strings and comments still never count as calls'
+    $dynamicSql = New-TestRelease 'Multiline execute immediate' "@first.sql`nBEGIN`n  EXECUTE IMMEDIATE '`n    CREATE TABLE DA.UETD_FLY_EMAILS`n    (AUTHOR VARCHAR2(300))`n    -- START decoy.pb`n    START decoy.pb`n    /* @decoy.pb */`n    TABLESPACE USERS';`n  DBMS_OUTPUT.PUT_LINE('Table Created');`nEND;`n/`nselect 'TIMESTAMPER End Table Update' || to_char(systimestamp, 'YYYY-MON-DD HH24:MI:SSSS') `" `" from dual;`nSTART aputil.ps;`nstart uigtoolsmessage.dat`nstart JSR_PYCHK01C.pb`nUPDATE settings`nSET value = 'multiline value:`nSTART decoy.pb`n'`nWHERE code = 'X';`nSTART final.sql" @{
+        'sql\first.sql' = 'select 1 from dual;'; 'sql\decoy.pb' = 'select 2 from dual;'
+        'sql\aputil.ps' = 'select 3 from dual;'; 'uig\sql\uigtoolsmessage.dat' = 'select 4 from dual;'
+        'uig\sql\JSR_PYCHK01C.pb' = 'select 5 from dual;'; 'sql\final.sql' = 'select 6 from dual;'
+    }
+    $dynamicAudit = Audit-Path $dynamicSql
+    Assert-Equal $dynamicAudit.Issues.Count 0 'Multiline EXECUTE IMMEDIATE and SQL UPDATE literals leave no false unterminated state'
+    Assert-Equal $dynamicAudit.References.Count 5 'Dynamic SQL content does not become a SQLPlus invocation or contribute fake calls'
+    foreach ($dynamicTarget in @('sql\first.sql','sql\aputil.ps','uig\sql\uigtoolsmessage.dat','uig\sql\JSR_PYCHK01C.pb','sql\final.sql')) {
+        Assert-Equal (Row $dynamicAudit $dynamicTarget).DirectCallCount 1 'Every active call after multiline dynamic SQL is retained'
+    }
+    Assert-Equal (Row $dynamicAudit 'sql\decoy.pb').DirectCallCount 0 'START-looking text inside dynamic SQL and UPDATE literals never counts'
+    $copiesRoot = New-TestRelease 'Cross-folder calls' "START APERROR.DAT`n@`"poerror.dat`"`nstart ..\uig\sql\explicit.pb`n@@caller.pb`nSTART missing\lookalike.pb`nPROMPT START decoy.pb`nselect 'START decoy.pb' from dual;" @{
+        'sql\aperror.dat' = 'DA data'; 'uig\sql\aperror.dat' = 'UIG data'; 'cf\sql\aperror.dat' = 'CF data'
+        'sql\poerror.dat' = 'DA po'; 'uig\sql\poerror.dat' = 'UIG po'; 'sql\old_aperror.dat' = 'lookalike'
+        'sql\explicit.pb' = 'wrong copy'; 'uig\sql\explicit.pb' = 'right copy'
+        'sql\caller.pb' = 'caller copy'; 'uig\sql\caller.pb' = 'other copy'
+        'sql\lookalike.pb' = 'wrong explicit path'; 'uig\sql\decoy.pb' = 'not called'
+    }
+    $copiesAudit = Audit-Path $copiesRoot
+    foreach ($copyPath in @('sql\aperror.dat','uig\sql\aperror.dat','cf\sql\aperror.dat','sql\poerror.dat','uig\sql\poerror.dat')) {
+        Assert-Equal (Row $copiesAudit $copyPath).DirectCallCount 1 'A bare filename directly called in the master covers every exact-name release copy'
+        Assert-Equal (Row $copiesAudit $copyPath).MatchingMethod 'FilenamePresence' 'Multiple-copy matches retain their evidence method'
+    }
+    foreach ($wrongCopy in @('sql\old_aperror.dat','sql\explicit.pb','uig\sql\caller.pb','sql\lookalike.pb','uig\sql\decoy.pb')) {
+        Assert-Equal (Row $copiesAudit $wrongCopy).DirectCallCount 0 'Substring lookalikes, wrong explicit paths and ignored text cannot create coverage'
+    }
+    Assert-Equal (Row $copiesAudit 'uig\sql\explicit.pb').DirectCallCount 1 'An explicit path covers only its exact copy'
+    Assert-Equal (Row $copiesAudit 'sql\caller.pb').DirectCallCount 1 '@@ retains caller-relative path matching for duplicate basenames'
+    Assert-True ((Get-CoverageSummary $copiesAudit) -match 'Bare filenames.*all exact-name copies') 'Summary discloses multiple-copy filename coverage'
+    $copiesNested = Audit-Path $copiesRoot $true
+    Assert-True (-not $copiesNested.Cache.ContainsKey((Join-Path $copiesRoot 'uig\sql\aperror.dat'))) 'Nested parsing never reads an extra filename copy by guessing its runtime location'
     $badBlock = New-TestRelease 'BadBlock' "/* unterminated`n@child.sql" @{ 'sql\child.sql' = 'select 1 from dual;' }
     Assert-Equal (Audit-Path $badBlock).ExitCode 2 'Unterminated block comment makes analysis incomplete'
+    Assert-True ((Audit-Path $badBlock).Issues[0].Message -match 'block comment opened at line 1') 'Unclosed comment reports its opening line'
+    $badLiteral = New-TestRelease 'Bad literal' "-- heading`nselect 'unterminated`nSTART child.sql" @{ 'sql\child.sql' = 'select 1 from dual;' }
+    $badLiteralAudit = Audit-Path $badLiteral
+    Assert-Equal (Row $badLiteralAudit 'sql\child.sql').DirectCallCount 0 'An unclosed real SQL literal does not count its embedded START text'
+    Assert-True ($badLiteralAudit.Issues[0].Message -match "SQL literal opened at line 2.*select 'unterminated") 'Unclosed SQL literal reports its opening line and source'
     $changedSyntax = New-TestRelease 'SyntaxSetting' "set def ^`n@child.sql" @{ 'sql\child.sql' = 'select 1 from dual;' }
     Assert-Equal (Audit-Path $changedSyntax).References[0].Status 'Unresolved' 'Custom substitution setting prevents confident matching'
     $standardDefine = New-TestRelease 'StandardDefine' "START first.pb`nset define on`n@second.ps`nset def off`n@second.ps`n@&dynamic" @{
@@ -247,15 +313,45 @@ try {
     Invoke-Audit $missingAudit
     Assert-Equal $missingAudit.ExitCode 2 'Inaccessible/nonexistent root is failed'
 
-    # A BOM selects UTF-16 automatically. Invalid non-BOM UTF-8 is not guessed.
+    # BOMs override Auto. Auto tries UTF-8 first, then Windows-1252 per file.
     $encoded = New-TestRelease 'Encoding' '@child.sql' @{ 'sql\child.sql' = 'select 1 from dual;' }
     Set-Content -LiteralPath (Join-Path $encoded 'sql\master.sql') -Value '@child.sql' -Encoding Unicode
     Assert-Equal (Audit-Path $encoded).ExitCode 0 'UTF-16 BOM detected'
     [IO.File]::WriteAllBytes((Join-Path $encoded 'sql\master.sql'), [byte[]]@(64, 99, 104, 105, 108, 100, 46, 115, 113, 108, 13, 10, 45, 45, 32, 233))
-    Assert-Equal (Audit-Path $encoded).ExitCode 2 'Invalid UTF-8 fails explicitly'
+    Assert-Equal (Audit-Path $encoded).ExitCode 0 'Default Auto handles legacy Windows bytes without prompting'
+    $ScriptEncoding = 'UTF8'
+    Assert-Equal (Audit-Path $encoded).ExitCode 2 'Explicit strict UTF-8 remains available'
     $ScriptEncoding = 'Default'
     Assert-Equal (Audit-Path $encoded).ExitCode 0 'Explicit system ANSI encoding supported'
     $ScriptEncoding = 'UTF8'
+
+    $ansiName = 'caf' + [char]0x00E9 + '.sql'
+    $ansiRoot = New-TestRelease 'ANSI master bytes' 'placeholder' @{
+        ('sql\' + $ansiName) = 'select 1 from dual;'; 'sql\child.sql' = 'select 2 from dual;'
+    }
+    $ansiMaster = Join-Path $ansiRoot 'sql\master.sql'
+    $ansiPrefix = "@child.sql`n--"
+    $ansiText = $ansiPrefix + [string]::new(' ', (40398 - $ansiPrefix.Length)) + [char]0x00A0 + "`n@" + $ansiName
+    [IO.File]::WriteAllBytes($ansiMaster, [Text.Encoding]::GetEncoding(1252).GetBytes($ansiText))
+    $ansiHash = (Get-FileHash -LiteralPath $ansiMaster -Algorithm SHA256).Hash
+    Assert-Equal ([IO.File]::ReadAllBytes($ansiMaster))[40398] 160 'ANSI case reproduces byte A0 at the reported offset'
+    $ansiFailed = Audit-Path $ansiRoot
+    Assert-Equal $ansiFailed.ExitCode 2 'Invalid UTF-8 is rejected without guessing an ANSI encoding'
+    Assert-True (-not $ansiFailed.MasterReadable) 'Partially decoded ANSI master cannot imply completed coverage'
+    Assert-True ($ansiFailed.Issues[0].Message -match '\[A0\] at index \d+') 'Failed UTF-8 decoding retains the offending byte and decoder position'
+    Assert-True ($ansiFailed.Issues[0].Message -match 'ScriptEncoding Default' -and $ansiFailed.Issues[0].Message -match 'ScriptEncoding Windows1252') 'No-BOM decoding error gives actionable ANSI commands'
+    $ScriptEncoding = 'Windows1252'
+    $ansiAudit = Audit-Path $ansiRoot
+    Assert-Equal $ansiAudit.ExitCode 0 'Explicit Windows1252 parses the entire A0-bearing master'
+    Assert-Equal (Row $ansiAudit ('sql\' + $ansiName)).DirectCallCount 1 'Windows1252 preserves an accented target filename'
+    Assert-Equal (Row $ansiAudit 'sql\child.sql').DirectCallCount 1 'Calls after the A0 byte remain checked'
+    $ansiBomRoot = New-TestRelease 'ANSI option BOM override' ('@' + $ansiName) @{ ('sql\' + $ansiName) = 'select 1 from dual;' }
+    Assert-Equal (Audit-Path $ansiBomRoot).ExitCode 0 'UTF-8 BOM overrides an explicitly selected Windows1252 encoding'
+    $binaryRoot = New-TestRelease 'ANSI binary guard' 'placeholder' @{}
+    [IO.File]::WriteAllBytes((Join-Path $binaryRoot 'sql\master.sql'), [byte[]]@(64, 0, 65))
+    Assert-Equal (Audit-Path $binaryRoot).ExitCode 2 'Explicit ANSI decoding retains binary/NUL rejection'
+    $ScriptEncoding = 'Auto'
+    Assert-Equal (Get-FileHash -LiteralPath $ansiMaster -Algorithm SHA256).Hash $ansiHash 'Encoding choices never change source script bytes'
 
     $linkRoot = New-TestRelease 'Links' 'select 1 from dual;' @{}
     $targetRoot = Join-Path $work 'ExternalLinkTarget'
@@ -297,6 +393,17 @@ try {
     $progressLog = Get-Content -Raw -LiteralPath $cleanRun.Log
     Assert-True ($progressLog -match '(?s)Validating release and master paths.*Scanning release folders.*Inventory complete: 2 files.*Reading master and checking calls.*Preparing coverage results.*Saving summary') 'Real CMD run reports validation, inventory, parsing, and writing stages'
     Assert-True ($cleanSummary -notmatch 'Detected resolved calls|CallChains|Unresolved / manual review|combined totals') 'Default summary omits detailed call trace sections'
+    $ansiAutoRun = Run-Cli @('-ReleasePath', $ansiRoot, '-MasterPath', 'sql\master.sql', '-NonInteractive') 'ansi-auto-cmd' $true
+    Assert-Equal $ansiAutoRun.ExitCode 0 'CMD automatic encoding completes without an encoding response'
+    Assert-True ((Get-Content -Raw -LiteralPath (Join-Path $ansiAutoRun.Folder 'summary.txt')) -match 'Encoding fallback:.*Windows1252' ) 'Automatic encoding choice is recorded in the single summary'
+    Assert-True ((Get-Content -Raw -LiteralPath $ansiAutoRun.Log) -notmatch 'Encoding retry Y/N|Retry this file') 'Automatic CMD run never requests encoding confirmation'
+    $ansiFailureRun = Run-Cli @('-ReleasePath', $ansiRoot, '-MasterPath', 'sql\master.sql', '-ScriptEncoding', 'UTF8') 'ansi-guidance'
+    Assert-Equal $ansiFailureRun.ExitCode 2 'Real process keeps incomplete status for invalid UTF-8'
+    Assert-True ((Get-Content -Raw -LiteralPath (Join-Path $ansiFailureRun.Folder 'summary.txt')) -match 'Check-Release.bat -ScriptEncoding Default') 'Saved failed summary includes the executable ANSI workaround'
+    Assert-True ((Get-Content -Raw -LiteralPath $ansiFailureRun.Log) -notmatch 'Retry this file as Windows-1252\?') 'Batch paths never prompt for an encoding retry'
+    $ansiSuccessRun = Run-Cli @('-ReleasePath', $ansiRoot, '-MasterPath', 'sql\master.sql', '-ScriptEncoding', 'Windows1252') 'ansi-cmd' $true
+    Assert-Equal $ansiSuccessRun.ExitCode 0 'CMD launcher forwards the explicit Windows1252 encoding'
+    Assert-True ((Get-Content -Raw -LiteralPath (Join-Path $ansiSuccessRun.Folder 'summary.txt')) -match 'Files called by master: 2') 'Explicit ANSI CMD run reports the complete file coverage'
     $uncalledRoot = New-TestRelease 'UncalledFile' 'select 1 from dual;' @{ 'sql\unused.sql' = 'select 2 from dual;' }
     $findingRun = Run-Cli @('-ReleasePath', $uncalledRoot, '-MasterPath', 'sql\master.sql') 'findings-batch' $true
     Assert-Equal $findingRun.ExitCode 1 'BAT launcher preserves findings exit one'
@@ -307,10 +414,10 @@ try {
     $partialSummary = Get-Content -Raw -LiteralPath (Join-Path $simplePartial.Folder 'summary.txt')
     Assert-Equal $simplePartial.ExitCode 2 'Simple summary preserves incomplete coverage status'
     Assert-Equal @(Get-ChildItem -LiteralPath $simplePartial.Folder -File).Count 1 'Incomplete default run still creates only one TXT'
-    Assert-True ($partialSummary -match 'Files checked: 27' -and $partialSummary -match 'Files called by master: 13' -and $partialSummary -match 'Files with no matching call: 14') 'Simple counts use direct master calls'
+    Assert-True ($partialSummary -match 'Files checked: 27' -and $partialSummary -match 'Files called by master: 16' -and $partialSummary -match 'Files with no matching call: 11') 'Simple counts include every exact basename directly called in the master'
     Assert-True ($partialSummary -match 'Some content or calls could not be checked' -and $partialSummary -notmatch 'Result: YES') 'Unresolved calls cannot produce a false clean result'
     $partialList = ($partialSummary -split 'Files with no matching call in the master:\r?\n')[1] -split '\r?\n\r?\nSummary saved to:' | Select-Object -First 1
-    Assert-Equal @($partialList -split '\r?\n' | Where-Object { $_.Trim() }).Count 14 'All 14 uncalled files appear once in the plain list'
+    Assert-Equal @($partialList -split '\r?\n' | Where-Object { $_.Trim() }).Count 11 'All 11 uncalled files appear once in the plain list'
     Assert-True ($partialList -match '(?m)^  sql\\subfolder\\indirect\.sql\r?$' -and $partialList -notmatch '(?m)^  sql\\py_post\.pb\r?$') 'List includes indirectly called files and excludes direct matches'
     $coveredExtras = New-TestRelease 'CoveredExtras' "@child.sql`n@child.sql`n@not-in-release.sql" @{ 'sql\child.sql' = 'select 1 from dual;' }
     $coverageOnly = Run-Cli @('-ReleasePath', $coveredExtras, '-MasterPath', 'sql\master.sql') 'coverage-only'
@@ -322,7 +429,7 @@ try {
     $fileCsv = @(Import-Csv -LiteralPath (Join-Path $nestedRun.Folder '01_Release_one_files.csv'))
     $refCsv = @(Import-Csv -LiteralPath (Join-Path $nestedRun.Folder '01_Release_one_references.csv'))
     Assert-Equal $fileCsv.Count 27 'Report has exactly one row per eligible file'
-    Assert-Equal $refCsv.Count 22 'References CSV contains all direct and reached call sites'
+    Assert-Equal $refCsv.Count 25 'References CSV contains every matching file for direct and reached calls'
     Assert-Equal @($fileCsv | Where-Object { $_.AuditStatus -eq 'Incomplete' }).Count 27 'Export preserves audit status'
     Assert-True ((Get-Content -Raw -LiteralPath (Join-Path $nestedRun.Folder '01_Release_one_summary.txt')) -match 'Unresolved / manual review') 'Text report includes manual review section'
     Assert-True ((Get-Content -Raw -LiteralPath $nestedRun.Log) -match [regex]::Escape($nestedRun.Folder)) 'Console shows full report paths'
@@ -347,8 +454,8 @@ try {
     Assert-Equal $multi.ExitCode 2 'Combined incomplete status takes precedence'
     Assert-Equal @(Get-ChildItem -LiteralPath $multi.Folder -Filter '*_files.csv').Count 3 'Independent report for each release including invalid release'
     $combined = Get-Content -Raw -LiteralPath (Join-Path $multi.Folder 'combined_summary.txt')
-    Assert-True ($combined -match 'Releases reviewed: 3' -and $combined -match 'Eligible files checked: 27' -and $combined -match 'Files directly referenced: 13') 'Combined totals are correct and readable'
-    Assert-True ($combined -match 'Ambiguous references: 1' -and $combined -match 'Call targets not found within scanned releases: 3') 'Combined reference findings are totaled'
+    Assert-True ($combined -match 'Releases reviewed: 3' -and $combined -match 'Eligible files checked: 27' -and $combined -match 'Files directly referenced: 16') 'Combined totals are correct and readable'
+    Assert-True ($combined -match 'Ambiguous references: 0' -and $combined -match 'Call targets not found within scanned releases: 3') 'Combined reference findings are totaled'
     Assert-True ($combined -match 'Files referenced only indirectly: Not checked') 'Direct-only combined report does not imply nested checking'
     Assert-Equal @(Import-Csv -LiteralPath (Join-Path $multi.Folder '03_Nonexistent_files.csv')).Count 0 'Failed audit still has header-only CSV'
     $failure = Run-Cli @('-ReleasePath', (Join-Path $fixtures 'Clean'), '-MasterPath', 'sql\absent.sql') 'missing-master'
@@ -446,6 +553,48 @@ try {
     $noWait = Run-Interactive $checker @((Join-Path $fixtures 'Clean'), '', '2') 'no-pause' -NoFinalPause
     Assert-Equal $noWait.ExitCode 0 'Explicit NoPause preserves interactive audit result'
     Assert-True ($noWait.Output -notmatch 'Press Enter to close this window') 'Explicit NoPause disables the final script wait'
+
+    $mixedName = 'ni' + [char]0x00F1 + 'o.pb'
+    $retryRoot = New-TestRelease 'Retry hotfix' 'placeholder' @{
+        ('sql\' + $ansiName) = 'select 1 from dual;'; 'sql\child.sql' = ('@' + $mixedName)
+        ('sql\' + $mixedName) = 'select 2 from dual;'
+    }
+    $retryMaster = Join-Path $retryRoot 'sql\Retry hotfix.sql'
+    Move-Item -LiteralPath (Join-Path $retryRoot 'sql\master.sql') -Destination $retryMaster
+    [IO.File]::WriteAllBytes($retryMaster, [Text.Encoding]::GetEncoding(1252).GetBytes($ansiText))
+    [IO.File]::WriteAllText((Join-Path $retryRoot 'sql\child.sql'), ('@' + $mixedName), [Text.UTF8Encoding]::new($false))
+    $retryHash = (Get-FileHash -LiteralPath $retryMaster -Algorithm SHA256).Hash
+    $retryAccepted = Run-Interactive $checker @($retryRoot, '', 'Y') 'retry-accepted' -VerifyKeepOpen -Nested
+    Assert-True $retryAccepted.HeldForClose 'Successful encoding retry retains the final interactive wait'
+    Assert-Equal $retryAccepted.ExitCode 1 'Confirmed per-file retry preserves direct versus indirect coverage status'
+    Assert-True ($retryAccepted.Output -notmatch 'Retry this file|Encoding retry Y/N|UTF-8 decoding failed for') 'Default encoding completes without a retry question or error screen'
+    Assert-True ($retryAccepted.Output -match 'Files called by master: 2' -and $retryAccepted.Output -notmatch 'COULD NOT CHECK|Some content or calls could not be checked') 'Retry checks calls before and after the invalid UTF-8 byte'
+    $retrySummaryFile = @(Get-ChildItem -LiteralPath (Join-Path $work 'retry-accepted-reports') -Filter summary.txt -File -Recurse)
+    $retrySummary = Get-Content -Raw -LiteralPath $retrySummaryFile[0].FullName
+    Assert-Equal @([regex]::Matches($retrySummary, '(?m)^Encoding fallback:')).Count 1 'Automatic per-file fallback is recorded once and leaves UTF-8 child decoding unchanged'
+    Assert-True $retryAccepted.Output.Contains($retrySummary.TrimEnd()) 'Retried console summary matches the single TXT'
+    Assert-Equal (Get-FileHash -LiteralPath $retryMaster -Algorithm SHA256).Hash $retryHash 'Interactive retry preserves source bytes'
+    $retryDetailed = Run-Interactive $checker @($retryRoot, '', 'Y') 'retry-mixed-details' -Nested -Detailed
+    Assert-Equal $retryDetailed.ExitCode 1 'Mixed-encoding detailed audit completes with the same coverage status'
+    $retryFilesCsv = @(Get-ChildItem -LiteralPath (Join-Path $work 'retry-mixed-details-reports') -Filter '*_files.csv' -File -Recurse)
+    Assert-Equal $retryFilesCsv.Count 1 'Detailed retry writes exactly one release files CSV'
+    $retryMixedRow = @(Import-Csv -LiteralPath $retryFilesCsv[0].FullName | Where-Object { $_.RelativeFilePath -ceq ('sql\' + $mixedName) })
+    Assert-Equal $retryMixedRow.Count 1 'UTF-8 child target retains its exact accented filename'
+    Assert-Equal $retryMixedRow[0].IndirectCallCount 1 'Retrying the ANSI master leaves the UTF-8 child decoder unchanged'
+    $retryStrict = Run-Interactive $checker @($retryRoot, '', 'Y') 'strict-encoding' -VerifyKeepOpen -StrictUtf8
+    Assert-Equal $retryStrict.ExitCode 2 'Explicit UTF8 keeps invalid legacy bytes incomplete'
+    Assert-True ($retryStrict.Output -match 'COULD NOT CHECK' -and $retryStrict.Output -notmatch '(?m)^Encoding fallback:|Retry this file') 'Explicit strict decoding never silently changes encoding or asks for a retry'
+    $retryDoubleClick = Run-Interactive (Join-Path $launchCopy 'Check-Release.bat') @($retryRoot, '', 'Y', 'x') 'retry-double-click' $true
+    Assert-Equal $retryDoubleClick.ExitCode 1 'Double-click BAT supports an encoding retry without extra arguments'
+    Assert-True ($retryDoubleClick.Output -match 'Files called by master: 2' -and $retryDoubleClick.Output -match 'Press any key to continue') 'Double-click retry finishes coverage and retains its pause'
+    $badBomRoot = New-TestRelease 'Retry invalid BOM' 'placeholder' @{}
+    $badBomMaster = Join-Path $badBomRoot 'sql\Retry invalid BOM.sql'
+    Move-Item -LiteralPath (Join-Path $badBomRoot 'sql\master.sql') -Destination $badBomMaster
+    [IO.File]::WriteAllBytes($badBomMaster, [byte[]]@(239, 187, 191, 160))
+    $badBomInteractive = Run-Interactive $checker @($badBomRoot, '', 'Y') 'retry-bad-bom'
+    Assert-Equal $badBomInteractive.ExitCode 2 'Malformed BOM-declared UTF-8 remains incomplete'
+    Assert-True ($badBomInteractive.Output -notmatch 'Retry this file as Windows-1252\?') 'A declared Unicode BOM never receives an ANSI retry prompt'
+
     Write-Host 'Checking malicious data, path aliases, and report write protections.'
     $sharpName = 'stra' + [char]0x00DF + 'e.sql'
     $unicodeRoot = New-TestRelease 'Unicode files' 'START strasse.sql' @{ ('sql\' + $sharpName) = '-- A different filename.' }

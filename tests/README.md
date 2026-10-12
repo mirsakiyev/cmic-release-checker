@@ -7,8 +7,8 @@ dependencies. They retain generated cases and reports outside fixture releases i
 
 | Fixture | Mode | Discovered | Excluded | Eligible | Direct | Not direct | Indirect only | Exit |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Release one | Direct | 36 | 8 | 27 | 13 | 14 | Not checked | 2 |
-| Release one | Nested | 36 | 8 | 27 | 13 | 14 | 1 | 2 |
+| Release one | Direct | 36 | 8 | 27 | 16 | 11 | Not checked | 2 |
+| Release one | Nested | 36 | 8 | 27 | 16 | 11 | 1 | 2 |
 | Release two | Direct | 2 | 1 | 0 | 0 | 0 | Not checked | 1 detailed / 0 simple |
 | Clean | Either | 2 | 0 | 1 | 1 | 0 | 0 if nested | 0 |
 | Settings | Direct | 4 | 0 | 3 | 2 | 1 | Not checked | 1 |
@@ -16,11 +16,13 @@ dependencies. They retain generated cases and reports outside fixture releases i
 
 `expected-release-one.csv` specifies the exact eligible file rows, direct status,
 nested status, matching method, and counts. Release one's two missing calls are
-`wrong\py_post.pb` and `missing.sql`; `dup.pb` has two ambiguous candidates;
+`wrong\py_post.pb` and `missing.sql`; `dup.pb` covers both exact-name copies;
 `&release_script` is unresolved. `py_post.pb` and `same.sql` each have two direct
 call sites. Nested mode adds two indirect call sites for `indirect.sql`, one cycle
-back to the master, and a third repeated target. There are 19 direct call-site
-records and 22 records with nesting. Commented, output-only, SQL literal-only,
+back to the master, and a fourth repeated target. There are 22 direct file-match
+records and 25 records with nesting. Multiple copies are separate matches to
+the same source line; they do not imply execution of every copy. Commented,
+output-only, SQL literal-only,
 substring lookalikes, and unrelated scripts never contribute coverage.
 
 Release two must not match `py_post.pb` from Release one. In Settings, nested
@@ -60,3 +62,28 @@ behavior is preserved. Long ordinary SQL lines retain subsequent calls, PROMPT
 text remains ignored, and a real CMD run shows each checking stage without
 changing its saved summary. These cases model metadata access; they do not
 connect to a live SMB server.
+
+Encoding regressions include a no-BOM Windows-1252 master with byte A0 near the
+reported failure position and an accented target filename. Explicit strict
+UTF-8 fails with a useful rerun command; automatic or explicit Windows1252
+finds calls before and after
+the offending byte. BOM overrides, source hashes, binary rejection, and actual
+CMD argument forwarding are also checked.
+
+Real interactive PowerShell, automated, and double-click CMD runs use per-file
+Windows-1252 fallback without an encoding question. This preserves calls around
+byte A0, source hashes, the final pause, and identical console/TXT summaries.
+A no-BOM UTF-8 child retains its accented target and indirect call after its
+ANSI master uses fallback. Explicit strict UTF-8 and malformed BOM-declared
+Unicode still fail without changing encoding. The harness reads
+the child process's console encoding so redirected accented output is decoded
+correctly.
+
+Parser regressions use the supplied TOR master pattern: multiline `EXECUTE
+IMMEDIATE` SQL followed by package, UIG data, and JSR calls. Calls inside dynamic
+SQL, UPDATE literals, alternate literals, and comments must never count; active
+calls after these constructs must remain visible. Genuine unclosed literals or
+comments report their opening line and source. SQL*Plus control/prompt text with
+apostrophes cannot consume later calls. Exact duplicate basenames cover all
+release copies for bare master START/@ calls; explicit paths, @@ paths, substring
+lookalikes, and nested path selection retain their separate expectations.
