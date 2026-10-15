@@ -9,7 +9,7 @@ dependencies. They retain generated cases and reports outside fixture releases i
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | Release one | Direct | 36 | 8 | 27 | 16 | 11 | Not checked | 2 |
 | Release one | Nested | 36 | 8 | 27 | 16 | 11 | 1 | 2 |
-| Release two | Direct | 2 | 1 | 0 | 0 | 0 | Not checked | 1 detailed / 0 simple |
+| Release two | Direct | 2 | 1 | 0 | 0 | 0 | Not checked | 1 |
 | Clean | Either | 2 | 0 | 1 | 1 | 0 | 0 if nested | 0 |
 | Settings | Direct | 4 | 0 | 3 | 2 | 1 | Not checked | 1 |
 | Settings | Nested | 4 | 0 | 3 | 1 | 2 | 0 | 2 |
@@ -42,12 +42,49 @@ Folder-name master detection is checked with spaces and mixed case: Y must use
 the detected file, N must allow a manually entered master, and blank/invalid
 confirmation answers must re-prompt. A missing candidate keeps the numbered menu.
 
-Normal runs must save exactly one `summary.txt`, with the same summary displayed
-in CMD. The harness verifies complete and incomplete counts, the full plain list
-of uncalled files, multiple releases in the same TXT, unreadable masters, and
-the absence of call traces/CSV files by default. Extra or repeated master targets
-do not change a complete file-coverage result in simple mode. Detailed-report
+Normal runs must save exactly one `summary_HOTFIX.txt` per hotfix, with the same
+summary displayed in CMD. Each hotfix gets its own `DATE_TIME_HOTFIX` folder.
+The harness verifies complete and incomplete counts, the full plain list
+of uncalled files, separate multi-hotfix reports, unreadable masters, and
+the absence of call traces/CSV files by default. Missing required master targets
+produce exit 1 in normal mode, independently of folder-to-master coverage.
+Repeated present targets alone still pass normal mode. Detailed-report
 checks explicitly pass `-DetailedReport` and retain their original expectations.
+
+The master call file check follows the existing coverage section in both report
+modes. Cases cover all 93 supplied exception entries, case-insensitive whole
+filenames, default `.sql` suffixes, `START`/`@`/`@@`, quoted arguments, explicit
+paths inside and outside the hotfix, and targets with excluded extensions.
+Multiple inventory copies count as one call per source line. Comments, SQL
+literals, and output text never create missing calls. Supplied exception files
+retain normal coverage; lookalikes, variables, and unknown suffixes cannot gain
+an exception. Nested calls retain their existing diagnostics. Real CMD runs
+verify exit codes, identical console/TXT sections, and `IgnoredMissing` evidence
+in detailed reference CSVs. Read failures must never report successful presence.
+Normal CMD/TXT summaries must omit ignored-call filenames, the manual-review
+list, and empty-target placeholders while retaining the ignored-call count and
+required missing files with line numbers. Only `START`/`@`/`@@` calls contribute
+to master file-call counts; unsupported command diagnostics stay in detailed
+reports. Unresolved actual script calls retain an incomplete result and a short
+note pointing to the detailed source lines and reasons.
+
+Report naming cases cover the exact supplied hotfix name, Toronto daylight and
+standard time, 12-hour AM/PM formatting, and numbered collisions that preserve
+earlier reports. Installer cases preserve all bytes outside the active
+`my $hotfix` value, including other variables, commented assignments, trailing
+comments, UTF-8/Windows-1252, all supported Unicode BOMs, and LF/CRLF endings.
+An already matching installer must retain its hash and modification time, even
+when read-only. Missing or duplicate assignments must remain unchanged and
+produce an incomplete result. Existing SQL fixture hashes must still match.
+
+Hotfix filename cases cover all five `.perl`/`.undeploy` suffixes, case-only
+renames on Windows, unchanged bytes and modification times, and already matching
+names. The inventory must see final names before resolving master calls. Backups,
+`.pl` files, unrelated prefixes/suffixes, and nested files keep their names.
+Duplicate suffixes and existing destination directories must not overwrite
+anything; unrelated unambiguous suffixes can still be renamed. A `sql` junction
+must not rename an external file. Real CMD runs verify all five resulting names,
+matching console/TXT rename notes, the execution-user header, and quiet reruns.
 
 Security cases cover Unicode filename collisions, master/source identity, CSV
 formula prefixes and quote/separator payloads, terminal escape and direction

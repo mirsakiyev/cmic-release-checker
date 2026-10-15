@@ -1,5 +1,17 @@
 # Release Script Checker security review
 
+Current behavior note (October 15, 2026): the checker now synchronizes only the
+literal `my $hotfix` value in `v12hotfixinstall\v12hotfixinstall.pl` with the
+selected release folder name, and renames the five supported `.perl`/`.undeploy`
+script filenames directly inside `sql` to match that folder. SQL contents stay
+read-only; renamed script contents and modification times are preserved. Name
+conflicts are reported without overwriting files. A matching installer
+is not rewritten. Installer edits preserve encoding, BOM, line endings, and
+unrelated content; failed or ambiguous edits are reported as incomplete.
+Reports now use per-hotfix `DATE_TIME_HOTFIX` folders and `summary_HOTFIX.txt`,
+with numbered folder suffixes for collisions. The review below records the
+earlier state; its read-only and GUID-folder descriptions are historical.
+
 Reviewed on October 12, 2026, using Windows PowerShell 5.1.19041.7725.
 The scope was the complete checker source, CMD launcher, configuration and
 documentation, test harness, fixtures, and distributable ZIP contents. The real
