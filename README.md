@@ -4,7 +4,9 @@ Checks which files in a release folder are directly called by a selected SQL
 master, then checks whether the files called by that master are present in the
 hotfix folder. It also synchronizes the installer's `my $hotfix` value with the
 release folder name and renames the five supported Perl/undeploy scripts inside
-`sql` to match that name. It never executes release scripts.
+`sql` to match that name. It also checks for zero-byte files and renames the
+hotfix DOCX in `documentation`, preserving the installation instructions.
+It never executes release scripts.
 
 ## Use
 
@@ -19,7 +21,8 @@ Double-click **Check-Release.bat**:
    selection menu appears automatically. Names are matched ignoring case.
 3. Read the result, counts, and list of files with no matching call in the master.
    The next section checks master calls for missing files and shows only a count
-   for allowed missing calls.
+   for allowed missing calls. The final file check lists 0KB files, or states that
+   none were found. Actual documentation or script renames appear near the top.
 
 Encoding is automatic by default: Unicode BOMs take precedence; otherwise the
 checker tries strict UTF-8, then Windows-1252 if UTF-8 decoding fails. It does
@@ -41,8 +44,12 @@ multi-hotfix runs. If the folder already exists, `_2`, `_3`, and so on are added
 to the folder name to preserve earlier reports. The window stays open so you can
 read the result.
 
-Every summary starts with `Executed by: <current Windows username>` before the
-release path. The username is detected automatically from the account running
+The startup title and four main summary sections use matching 83-column
+asterisk boxes in CMD and in the saved TXT file. The same section styling is
+also used in detailed reports and their combined-total header.
+
+Every summary places `Executed by: <current Windows username>` below its title
+box and before the release path. The username is detected automatically from the account running
 the script and is included in normal, detailed, and combined summaries.
 
 While checking, the console shows validation, folder scanning, master reading,
@@ -52,8 +59,9 @@ progress messages do not add anything to the saved summary.
 Example summary:
 
 ```text
-Release Script Checker
-
+***********************************************************************************
+*  Release Script Checker                                                         *
+***********************************************************************************
 Executed by: Aslan.Mirsakiyev
 Release: C:\Aslan\TEMP\V12-023-2-02-HF-AMA-21
 Selected master: C:\Aslan\TEMP\V12-023-2-02-HF-AMA-21\sql\V12-023-2-02-HF-AMA-21.sql
@@ -62,19 +70,28 @@ Files checked: 5
 Files called by master: 3
 Files with no matching call: 2
 
-Files with no matching call in the master:
+***********************************************************************************
+*  Files with no matching call in the master                                      *
+***********************************************************************************
   sql\extra_patch.sql
   sql\unused_package.pkb
 
-Master call file check (hotfix folder):
+***********************************************************************************
+*  Master call file check (hotfix folder)                                         *
+***********************************************************************************
 File presence result: NO - 1 required call(s) have no matching file in the hotfix folder.
 Master calls checked: 5
 Calls with files present: 3
 Allowed missing calls ignored: 1
 Required calls missing files: 1
 
-Required files missing from hotfix folder (master line numbers):
+Required files missing from hotfix folder (master line numbers)
   missing_patch.pb (line 12)
+
+***********************************************************************************
+*  0KB file check                                                                 *
+***********************************************************************************
+0KB files were not found.
 
 ```
 
@@ -111,7 +128,9 @@ Windows PowerShell 5.1 is required; no additional tools or modules are needed.
   after the closing quote remain visible. SQL*Plus prompts and control text
   cannot leave an open SQL literal that hides later calls.
 - Variables, ambiguous filenames, unsupported calls, read errors, and skipped
-  links require review. A short note appears when the check is incomplete.
+  links require review. Specific error reasons and unresolved-script notes remain
+  visible; the two repeated general incomplete-check notes are omitted.
+  Incomplete exit codes and detailed diagnostics are retained.
   An uncalled supporting file does not necessarily indicate a deployment error.
 
 ## Master calls missing from the hotfix
@@ -187,7 +206,42 @@ Terminal controls and invisible direction markers are shown as `\uXXXX` escapes.
 Formula-like values in detailed CSVs receive a visible `text:` prefix; downstream
 CSV consumers must account for that prefix. Release SQL file contents remain
 unchanged. The only release changes are the installer assignment update and
-the five supported script filename changes described below.
+the supported script and documentation filename changes described below.
+
+## 0KB files
+
+The checker scans the whole hotfix recursively for files with an exact size of
+zero bytes. Only `.pl`, `.perl`, `.undeploy`, and `.txt` extensions are ignored,
+without regard to case. The separate master-call coverage exclusions do not
+apply to this check: empty ZIP, DOCX, Java, bundle, and other files still count.
+The selected master is also checked. Nonempty files smaller than 1KB do not count.
+
+Both summary modes list each zero-byte file by its relative path. A complete
+scan with no findings says `0KB files were not found.` Zero-byte findings return
+exit code `1`, even when both master-call checks pass. If part of the folder
+cannot be scanned, the summary identifies the result as incomplete instead of
+claiming that no zero-byte files exist. This check does not modify any files.
+
+## Documentation filename
+
+The checker looks directly inside `HOTFIX\documentation` and leaves
+`Hotfix Installation Instructions for V12C.docx` unchanged, including its
+filename, contents, and modification time. This exclusion ignores case.
+Office `~$` lock files and documents in subfolders are not rename candidates.
+
+The other DOCX is renamed to `HOTFIX.docx`. For example, inside
+`V12-023-2-02-HF-ALC-02\documentation`, an older hotfix document becomes
+`V12-023-2-02-HF-ALC-02.docx`. The old document can have a different release or
+build number. The folder's exact casing and lowercase `.docx` are used.
+
+The rename preserves document contents and modification time. Already matching
+names are skipped; only an actual change is noted in the summary. A missing
+documentation folder or an absent hotfix DOCX is skipped. If multiple DOCX files
+remain after the exclusions, or the destination exists, nothing is overwritten
+and the run reports the reason with exit code `2`. Symbolic links and junctions
+are not followed. Renaming happens before inventory, so the file checks see the
+final name. Empty DOCX files, including the installation instructions, still
+count in the separate 0KB check.
 
 ## Hotfix script filenames
 
@@ -232,6 +286,16 @@ A missing installer is skipped. Comments, other variables, whitespace, line
 endings, the encoding, and any byte-order mark are preserved. The checker does
 not execute the Perl file. An actual edit is noted in the summary.
 
+Installer updates prepare and flush a complete temporary file in the same
+directory, recheck the original bytes while denying other writers, and use
+Windows file replacement. The live installer is never truncated in place.
+The original is retained in a temporary backup during replacement; both
+temporary files are removed after success. A failure before replacement removes
+the staged file. If replacement itself fails, recovery files are preserved and
+their paths are included in the failure summary. There is no fallback to an
+in-place write. An interrupted process may leave `.release-checker-*.tmp` or
+`.release-checker-*.bak` siblings, which are never executed.
+
 If the installer cannot be updated, or the checker cannot find exactly one
 literal `my $hotfix` assignment, the run reports the reason and exits with `2`.
 It does not guess which assignment to change or write through symbolic links,
@@ -239,14 +303,33 @@ junctions, or hardlinks. Installer decoding recognizes
 Unicode BOMs, otherwise UTF-8 with a Windows-1252 fallback, independently of
 the SQL `-ScriptEncoding` setting.
 
+Assignments inside ordinary comments, POD documentation, multiline quoted
+strings, and `__DATA__`/`__END__` sections are not active assignments. Escaped
+quotes in the value are supported. Complete one-line imports of literal symbol
+names and tags, such as `use Fcntl qw(:DEFAULT :flock);`, are recognized without
+loading the Perl module. The import list must use parentheses and contain only
+letters, digits, underscores, colons, spaces or tabs; a trailing comment is
+allowed. The guard does not skip arbitrary `use` statements or extra code.
+
+The edit guard is conservative: if other complex
+Perl syntax such as a regex, quote operator, heredoc or format occurs before a
+potential assignment and cannot be safely classified, it leaves the installer
+unchanged and reports the source line/column and that a manual update is needed.
+This is a static check,
+not a full Perl parser. Only context through the last potential assignment
+needs inspection; ordinary code after it does not prevent an update.
+
+Installer values, renamed hook/DOCX files, and report names use the release
+folder's stored spelling, even if its input path uses different capitalization.
+
 Each parsed script is limited to 64 MB by default. Use `-MaxScriptSizeMB 128` for
 larger legitimate scripts. Exceeding the limit produces an incomplete result.
 Detailed reports include source lines and arguments: keep them in a folder you
 control. See [SECURITY-AUDIT.md](SECURITY-AUDIT.md) for the review and remaining
 limitations, including concurrent filesystem changes and large directory trees.
 
-Default exit codes: `0` all checked files have matching master calls and all
-required master calls have files in the hotfix; `1` either check has findings;
+Default exit codes: `0` both master-call checks pass and no reportable 0KB files
+are found; `1` any of these checks has findings;
 `2` the check is incomplete or failed. Allowed missing calls do not produce
 findings. The highest code wins for multiple releases. In detailed mode,
 nested missing targets, repetitions, and cycles can also produce `1`.
@@ -263,5 +346,7 @@ keeping the interactive window open. They also cover missing master targets,
 all 93 exception entries, exact filename matching, and independent results for
 the two checks, report naming/collisions, installer edits with encoding,
 line-ending, and no-op preservation, and hook renames with case normalization,
-content preservation, and conflict handling. See `tests\README.md`. Generated test
+content preservation, and conflict handling. Further cases verify recursive
+zero-byte results, the four ignored extensions, and DOCX renames that preserve
+the installation instructions. See `tests\README.md`. Generated test
 reports stay under `tests\.work`, outside the fixture releases.

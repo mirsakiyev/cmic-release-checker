@@ -44,6 +44,10 @@ confirmation answers must re-prompt. A missing candidate keeps the numbered menu
 
 Normal runs must save exactly one `summary_HOTFIX.txt` per hotfix, with the same
 summary displayed in CMD. Each hotfix gets its own `DATE_TIME_HOTFIX` folder.
+The startup and main summary headings use the requested 83-column asterisk
+boxes. Saved summaries and console output must retain the same section order,
+counts, filenames, and username. The normal summary omits the two general
+incomplete-check notes, while exit codes and detailed diagnostics are retained.
 The harness verifies complete and incomplete counts, the full plain list
 of uncalled files, separate multi-hotfix reports, unreadable masters, and
 the absence of call traces/CSV files by default. Missing required master targets
@@ -76,6 +80,30 @@ comments, UTF-8/Windows-1252, all supported Unicode BOMs, and LF/CRLF endings.
 An already matching installer must retain its hash and modification time, even
 when read-only. Missing or duplicate assignments must remain unchanged and
 produce an incomplete result. Existing SQL fixture hashes must still match.
+Additional security cases reject assignment examples in POD, data sections,
+multiline strings and backticks; complex heredoc, regex, quote-operator and
+format contexts must fail without modifying bytes. Unambiguous assignments
+around documentation, strings, data markers, and CR-only line endings still
+update correctly. Escaped quote/interpolation characters must round-trip and
+already matching values remain unchanged. A competing read handle must block
+replacement, preserve the original bytes, remove the staging file, and allow a
+successful retry after closing. Differently cased input paths must retain the
+stored release-folder spelling in installer values and renamed files.
+Quote operators with word or next-line delimiters are also rejected. A separate
+fault-injection case simulates replacement failing after the original is moved:
+both the byte-identical original backup and the complete prepared replacement
+must survive, with recovery paths in the summary and exit 2. This models a
+documented Windows error condition; it does not simulate physical disk failure.
+
+Installer import regressions use the supplied module/header declarations,
+including `use Fcntl qw(:DEFAULT :flock);`, in the encoding/BOM cases and a real
+CMD run. Only the `my $hotfix` value may change; patch settings, imports and the
+remaining installer body stay byte-identical. CMD/TXT output must agree, no
+staging/backup files remain on success, and reruns must preserve the hash and
+timestamp. Namespaced modules, empty literal lists, whitespace and trailing
+comments are supported. Multiline/malformed import lists and an import followed
+by additional code are not blindly skipped; rejected syntax includes its source
+line and column. Installer content is only read as text and is never executed.
 
 Hotfix filename cases cover all five `.perl`/`.undeploy` suffixes, case-only
 renames on Windows, unchanged bytes and modification times, and already matching
@@ -85,6 +113,21 @@ Duplicate suffixes and existing destination directories must not overwrite
 anything; unrelated unambiguous suffixes can still be renamed. A `sql` junction
 must not rename an external file. Real CMD runs verify all five resulting names,
 matching console/TXT rename notes, the execution-user header, and quiet reruns.
+
+Zero-byte checks include recursive paths, the selected master, ZIP/DOCX/bundle
+and other extensions excluded from call coverage, and mixed-case `.pl`/`.perl`/
+`.undeploy`/`.txt` exclusions. Nonempty files smaller than 1KB must not count.
+Findings must return exit 1 even when master coverage passes. A complete clean
+scan must say `0KB files were not found`; a skipped directory must not make that
+claim. Original file hashes must remain unchanged by this check.
+
+Documentation cases include the usual pair of DOCX files: the installation
+instructions must retain their name, bytes and modification time while the
+other document is renamed. Tests also cover case-only renames, older release
+numbers, already matching names, Office lock files, nested documents, multiple
+candidates, destination directories, and junctions. Empty renamed DOCX files
+must appear in zero-byte output under their final name. Real CMD and detailed
+runs verify zero-byte exit codes, saved/console summaries, and combined totals.
 
 Security cases cover Unicode filename collisions, master/source identity, CSV
 formula prefixes and quote/separator payloads, terminal escape and direction

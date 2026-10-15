@@ -150,6 +150,115 @@ try {
     Write-Host ('Testing on Windows PowerShell ' + $PSVersionTable.PSVersion)
     Assert-True ($PSVersionTable.PSVersion.Major -eq 5 -and $PSVersionTable.PSVersion.Minor -eq 1) 'Run this harness with Windows PowerShell 5.1'
     $before = Fixture-Hashes
+    Write-Host 'Checking zero-byte files and documentation names.'
+    $zeroPaths = @('sql\empty.sql', 'data\zero.dat', 'archives\empty.zip', 'payload\empty.bundle', 'docs\empty.docx', 'data\empty.properties', 'scripts\support.pl.bak')
+    $ignoredZeroPaths = @('scripts\support.PL', 'scripts\support.PERL', 'scripts\support.UNDEPLOY', 'docs\notes.TxT')
+    $zeroFiles = @{ 'data\one.dat' = 'placeholder'; 'archives\small.zip' = 'placeholder' }
+    foreach ($relative in @($zeroPaths) + @($ignoredZeroPaths)) { $zeroFiles[$relative] = 'placeholder' }
+    $zeroRoot = New-TestRelease 'Zero-byte inventory' "@empty.sql`n@zero.dat`n@one.dat`n@support.pl.bak" $zeroFiles
+    foreach ($relative in @($zeroPaths) + @($ignoredZeroPaths)) { [IO.File]::WriteAllBytes((Join-Path $zeroRoot $relative), [byte[]]@()) }
+    [IO.File]::WriteAllBytes((Join-Path $zeroRoot 'data\one.dat'), [byte[]]@(255))
+    [IO.File]::WriteAllBytes((Join-Path $zeroRoot 'archives\small.zip'), [byte[]]@(1,2,3))
+    $zeroBefore = @(Get-ChildItem -LiteralPath $zeroRoot -File -Recurse | Sort-Object FullName | ForEach-Object { $_.FullName + (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash }) -join '|'
+    $zeroAudit = Audit-Path $zeroRoot
+    Assert-Equal $zeroAudit.ZeroByteFiles.Count 7 'Recursive zero-byte detection checks all file types except the four explicit exclusions'
+    Assert-Equal $zeroAudit.Counts['0KB files found'] 7 'Zero-byte findings are included in report totals'
+    Assert-Equal $zeroAudit.Counts['Files not directly referenced'] 0 'Zero-byte findings are independent of successful master call coverage'
+    Assert-Equal $zeroAudit.ExitCode 1 'Zero-byte findings alone produce the findings exit code'
+    foreach ($relative in $zeroPaths) { Assert-True (@($zeroAudit.ZeroByteFiles | Where-Object { $_.RelativePath -ceq $relative }).Count -eq 1) 'Each zero-byte file is listed by its full relative path'
+    }
+    Assert-Equal @($zeroAudit.ZeroByteFiles | Where-Object { $_.RelativePath -in $ignoredZeroPaths -or $_.Name -in @('one.dat', 'small.zip') }).Count 0 'Ignored extensions and nonempty files smaller than 1KB are not reported'
+    Assert-Equal (@(Get-ChildItem -LiteralPath $zeroRoot -File -Recurse | Sort-Object FullName | ForEach-Object { $_.FullName + (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash }) -join '|') $zeroBefore 'Zero-byte detection never modifies source files'
+    Assert-True ((Get-CoverageSummary $zeroAudit) -match '(?s)0KB file check.*0KB files found: 7.*archives\\empty.zip') 'Normal summaries include zero-byte findings and paths'
+    Assert-True ((Get-Summary $zeroAudit) -match '(?s)0KB file check.*0KB files found: 7') 'Detailed summaries include the same zero-byte check'
+    $ignoredOnlyFiles = @{}
+    foreach ($relative in $ignoredZeroPaths) { $ignoredOnlyFiles[$relative] = 'placeholder' }
+    $ignoredOnlyRoot = New-TestRelease 'Ignored zero-byte files' 'select 1 from dual;' $ignoredOnlyFiles
+    foreach ($relative in $ignoredZeroPaths) { [IO.File]::WriteAllBytes((Join-Path $ignoredOnlyRoot $relative), [byte[]]@()) }
+    $ignoredOnlyAudit = Audit-Path $ignoredOnlyRoot
+    Assert-Equal $ignoredOnlyAudit.ExitCode 0 'Empty files with ignored extensions do not create a zero-byte finding'
+    Assert-True ((Get-ZeroByteSummary $ignoredOnlyAudit) -match '0KB files were not found\.') 'A complete clean scan explicitly reports that no 0KB files were found'
+    $emptyMasterRoot = New-TestRelease 'Empty master file' 'placeholder' @{}
+    [IO.File]::WriteAllBytes((Join-Path $emptyMasterRoot 'sql\master.sql'), [byte[]]@())
+    $emptyMasterAudit = Audit-Path $emptyMasterRoot
+    Assert-Equal $emptyMasterAudit.ZeroByteFiles.Count 1 'The selected master is included in the zero-byte scan'
+    Assert-Equal $emptyMasterAudit.ZeroByteFiles[0].RelativePath 'sql\master.sql' 'An empty master is named in the zero-byte results'
+    Assert-Equal $emptyMasterAudit.ExitCode 1 'An empty master cannot produce a clean completed run'
+
+    $docHotfix = 'V12-023-2-02-HF-ALC-02'
+    $docRoot = New-TestRelease $docHotfix '@keep.pdf' @{
+        'documentation\V12-023-2-02-HF-ALC-01.docx' = 'placeholder'
+        'documentation\Hotfix Installation Instructions for V12C.docx' = 'Preserve installation instructions.'
+        'documentation\sub\keep.docx' = 'Nested document; do not rename.'
+        'documentation\~$Office.docx' = 'Office lock file; do not rename.'
+        'documentation\keep.pdf' = 'A different document type.'
+    }
+    $oldDoc = Join-Path $docRoot 'documentation\V12-023-2-02-HF-ALC-01.docx'
+    [IO.File]::WriteAllBytes($oldDoc, [byte[]]@(80,75,3,4,0,255,13,10,127))
+    $docHash = (Get-FileHash -LiteralPath $oldDoc -Algorithm SHA256).Hash
+    $docTime = [IO.File]::GetLastWriteTimeUtc($oldDoc).Ticks
+    $instructionsFile = Join-Path $docRoot 'documentation\Hotfix Installation Instructions for V12C.docx'
+    $instructionsHash = (Get-FileHash -LiteralPath $instructionsFile -Algorithm SHA256).Hash
+    $instructionsTime = [IO.File]::GetLastWriteTimeUtc($instructionsFile).Ticks
+    $docAudit = Audit-Path $docRoot
+    $newDoc = Join-Path $docRoot ('documentation\' + $docHotfix + '.docx')
+    Assert-Equal $docAudit.ExitCode 0 'A documentation rename completes without a coverage finding'
+    Assert-True (Test-Path -LiteralPath $newDoc -PathType Leaf) 'The documentation filename matches the exact supplied hotfix name'
+    Assert-True (-not (Test-Path -LiteralPath $oldDoc)) 'The previous documentation name is removed'
+    Assert-Equal (Get-FileHash -LiteralPath $newDoc -Algorithm SHA256).Hash $docHash 'DOCX binary contents remain byte-for-byte identical'
+    Assert-Equal ([IO.File]::GetLastWriteTimeUtc($newDoc).Ticks) $docTime 'DOCX renaming preserves its modification time'
+    Assert-True (Test-Path -LiteralPath $instructionsFile -PathType Leaf) 'Installation instructions retain their original filename'
+    Assert-Equal (Get-FileHash -LiteralPath $instructionsFile -Algorithm SHA256).Hash $instructionsHash 'Installation instructions retain their exact contents'
+    Assert-Equal ([IO.File]::GetLastWriteTimeUtc($instructionsFile).Ticks) $instructionsTime 'Installation instructions retain their modification time'
+    Assert-True ($docAudit.ByPath.ContainsKey($newDoc) -and -not $docAudit.ByPath.ContainsKey($oldDoc)) 'The inventory contains the final documentation name'
+    Assert-True ((Get-CoverageSummary $docAudit) -match 'Documentation renamed:') 'An actual documentation rename is recorded in the summary'
+    Assert-True (Test-Path -LiteralPath (Join-Path $docRoot 'documentation\sub\keep.docx')) 'Nested DOCX files keep their names'
+    Assert-True (Test-Path -LiteralPath (Join-Path $docRoot 'documentation\~$Office.docx')) 'Office lock files are not documentation rename candidates'
+    Assert-True ([string]::IsNullOrEmpty((Audit-Path $docRoot).DocumentationNote)) 'Already matching documentation is skipped without redundant output'
+    Assert-Equal ([IO.File]::GetLastWriteTimeUtc($newDoc).Ticks) $docTime 'An already matching document keeps its modification time'
+    $instructionsOnlyRoot = New-TestRelease 'Instructions-only documentation' 'select 1 from dual;' @{ 'documentation\hotfix installation instructions for v12c.DOCX' = 'Keep these instructions.' }
+    $instructionsOnlyAudit = Audit-Path $instructionsOnlyRoot
+    Assert-Equal $instructionsOnlyAudit.ExitCode 0 'Instructions are excluded from rename candidates ignoring case'
+    Assert-True ([string]::IsNullOrEmpty($instructionsOnlyAudit.DocumentationNote)) 'An instructions-only folder does not trigger a rename or error'
+    $caseDocHotfix = 'V12-023-2-02-HF-ALC-03'
+    $caseDocRoot = New-TestRelease $caseDocHotfix 'select 1 from dual;' @{ ('documentation\' + $caseDocHotfix.ToLowerInvariant() + '.DOCX') = 'Opaque document data.' }
+    Assert-Equal (Audit-Path $caseDocRoot).ExitCode 0 'A case-only documentation rename succeeds on Windows'
+    Assert-Equal (Get-ChildItem -LiteralPath (Join-Path $caseDocRoot 'documentation') -File).Name ($caseDocHotfix + '.docx') 'Documentation name and extension use the exact target casing'
+    $docConflictHotfix = 'V12-023-2-02-HF-ALC-04'
+    $docConflictRoot = New-TestRelease $docConflictHotfix 'select 1 from dual;' @{
+        'documentation\old.docx' = 'Preserve the old document.'
+        ('documentation\' + $docConflictHotfix + '.docx') = 'Preserve the target document.'
+    }
+    $docConflictBefore = @(Get-ChildItem -LiteralPath (Join-Path $docConflictRoot 'documentation') -File | Sort-Object Name | ForEach-Object { $_.Name + (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash }) -join '|'
+    $docConflictAudit = Audit-Path $docConflictRoot
+    Assert-Equal $docConflictAudit.ExitCode 2 'Multiple documentation candidates are reported without guessing or overwriting'
+    Assert-True ($docConflictAudit.DocumentationNote -match 'Multiple DOCX files') 'The documentation ambiguity is explained in the summary'
+    Assert-Equal (@(Get-ChildItem -LiteralPath (Join-Path $docConflictRoot 'documentation') -File | Sort-Object Name | ForEach-Object { $_.Name + (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash }) -join '|') $docConflictBefore 'All conflicting documentation files keep their names and bytes'
+    $emptyDocHotfix = 'V12-023-2-02-HF-ALC-05'
+    $emptyDocRoot = New-TestRelease $emptyDocHotfix 'select 1 from dual;' @{ 'documentation\old.docx' = 'placeholder' }
+    [IO.File]::WriteAllBytes((Join-Path $emptyDocRoot 'documentation\old.docx'), [byte[]]@())
+    $emptyDocAudit = Audit-Path $emptyDocRoot
+    Assert-Equal $emptyDocAudit.ExitCode 1 'An empty DOCX remains a zero-byte finding after being renamed'
+    Assert-Equal $emptyDocAudit.ZeroByteFiles[0].RelativePath ('documentation\' + $emptyDocHotfix + '.docx') 'Zero-byte output uses the final documentation filename'
+    $docDirectoryHotfix = 'V12-023-2-02-HF-ALC-06'
+    $docDirectoryRoot = New-TestRelease $docDirectoryHotfix 'select 1 from dual;' @{ 'documentation\old.docx' = 'Preserve this document.' }
+    [void](New-Item -ItemType Directory -Path (Join-Path $docDirectoryRoot ('documentation\' + $docDirectoryHotfix + '.docx')))
+    Assert-Equal (Audit-Path $docDirectoryRoot).ExitCode 2 'An existing destination directory cannot be overwritten by a DOCX rename'
+    Assert-True (Test-Path -LiteralPath (Join-Path $docDirectoryRoot 'documentation\old.docx') -PathType Leaf) 'A documentation destination conflict preserves the source name'
+    $externalDocs = Join-Path $work 'external-documentation'
+    [void](New-Item -ItemType Directory -Path $externalDocs)
+    $externalDoc = Join-Path $externalDocs 'old.docx'
+    Set-Content -LiteralPath $externalDoc -Value 'Preserve the external document.' -Encoding UTF8
+    $externalDocHash = (Get-FileHash -LiteralPath $externalDoc -Algorithm SHA256).Hash
+    $docLinkRoot = New-TestRelease 'V12-023-2-02-HF-ALC-08' 'select 1 from dual;' @{}
+    [void](New-Item -ItemType Junction -Path (Join-Path $docLinkRoot 'documentation') -Value $externalDocs)
+    $docLinkAudit = Audit-Path $docLinkRoot
+    Assert-Equal $docLinkAudit.ExitCode 2 'A documentation junction is reported without following it'
+    Assert-True (Test-Path -LiteralPath $externalDoc -PathType Leaf) 'A documentation junction cannot rename an external document'
+    Assert-Equal (Get-FileHash -LiteralPath $externalDoc -Algorithm SHA256).Hash $externalDocHash 'A documentation junction cannot change external document bytes'
+    Assert-True (-not $docLinkAudit.InventoryComplete) 'Skipped directories make the zero-byte inventory incomplete'
+    Assert-True ((Get-ZeroByteSummary $docLinkAudit) -match 'could not be fully checked' -and (Get-ZeroByteSummary $docLinkAudit) -notmatch 'were not found') 'An incomplete scan cannot claim no 0KB files were found'
+
     Write-Host 'Checking named report folders and installer hotfix synchronization.'
     Assert-Equal (Get-ReportTimestamp ([datetime]::new(2026,10,15,16,15,0,[DateTimeKind]::Utc))) '20261015_1215PM' 'Report time uses Toronto local time in the requested date/time format'
     Assert-Equal (Get-ReportTimestamp ([datetime]::new(2026,10,15,4,5,0,[DateTimeKind]::Utc))) '20261015_1205AM' 'Midnight uses the 12-hour AM format'
@@ -165,6 +274,20 @@ try {
 
     $installerTemplate = @'
 #!/usr/bin/perl
+use strict;
+use Cwd;
+use Config;
+use File::Copy;
+use File::Path;
+use File::Find ();
+use File::Basename;
+use File::Spec;
+use Time::localtime;
+use XML::Parser;
+use Sys::Hostname;
+use Socket;
+use Fcntl qw(:DEFAULT :flock);
+my $patch = "v12-023-2";
 # my $hotfix = "COMMENTED";
 my $hotfixes = "OTHER_VARIABLE";
   my  $hotfix = "OLD_HOTFIX_NAME_LONGER_THAN_THE_NEW_ONE_1234567890"; # keep this comment
@@ -201,9 +324,94 @@ my $other = "OLD_HOTFIX_NAME_LONGER_THAN_THE_NEW_ONE_1234567890";
         Assert-Equal (Get-FileHash -LiteralPath $installerFile -Algorithm SHA256).Hash $matchingHash 'A matching installer retains its exact bytes'
         Assert-True ([string]::IsNullOrEmpty($matchingAudit.InstallerNote)) 'A matching installer does not add redundant update output'
     }
+    $userInstallerText = @'
+#!/usr/bin/perl
+use strict;
+use Cwd;
+use Config;
+use File::Copy;
+use File::Path;
+use File::Find ();
+use File::Basename;
+use File::Spec;
+use Time::localtime;
+use XML::Parser;
+use Sys::Hostname;
+use Socket;
+use Fcntl qw(:DEFAULT :flock);
+
+# The hotfix number - Edit this value for each release!
+# This is also the name of the directory where the hotfix files to be copied are found.
+# default value
+# not needed to declare
+my $patch = "v12-023-2";
+my $hotfix = "V12-023-2-02-HF-AMA-01";
+my $isCustomHF = 1;
+my $standardHotfixHasToBeInstalled = "v12-023-2-hf-02";
+my $hotfix_exec_sql_scriptname = $hotfix.".sql";
+my @prev_patch_list = ("v12-023-2","V12-023-2");
+my @changed_subdirs = qw (forms java jsp jspsql patch reports sql uig web jreports jasper cf);
+my $hostname = `hostname`;
+# A static audit must never execute the installer body.
+die "Installer content must never execute";
+'@
+    $userHotfix = 'V12-023-2-02-HF-AMA-21'
+    $userInstallerRoot = New-TestRelease ('installer-user-reproduction\' + $userHotfix) 'select 1 from dual;' @{
+        'v12hotfixinstall\v12hotfixinstall.pl' = ''
+    }
+    $userInstallerPath = Join-Path $userInstallerRoot 'v12hotfixinstall\v12hotfixinstall.pl'
+    [IO.File]::WriteAllText($userInstallerPath, $userInstallerText, [Text.UTF8Encoding]::new($false))
+    $userMasterPath = Join-Path $userInstallerRoot 'sql\master.sql'
+    $userMasterHash = (Get-FileHash -LiteralPath $userMasterPath).Hash
+    $userInstallerRun = Run-Cli @('-ReleasePath', $userInstallerRoot, '-MasterPath', 'sql\master.sql') 'installer-fcntl-import' $true
+    Assert-Equal $userInstallerRun.ExitCode 0 'The real CMD launcher accepts the supplied installer header with its Fcntl qw import'
+    $expectedUserInstaller = $userInstallerText.Replace('my $hotfix = "V12-023-2-02-HF-AMA-01";', ('my $hotfix = "' + $userHotfix + '";'))
+    Assert-Equal ([Convert]::ToBase64String([IO.File]::ReadAllBytes($userInstallerPath))) ([Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($expectedUserInstaller))) 'The supplied header changes only the hotfix value, leaving imports, patch settings and installer body byte-identical'
+    Assert-Equal (Get-FileHash -LiteralPath $userMasterPath).Hash $userMasterHash 'The supplied installer regression leaves the SQL master unchanged'
+    $userInstallerSummary = Get-Content -Raw -LiteralPath $userInstallerRun.SummaryPath
+    Assert-True ($userInstallerSummary.Contains('Installer updated:') -and -not $userInstallerSummary.Contains('Installer update failed:')) 'The supplied header produces a successful installer result in the summary'
+    Assert-True ((Get-Content -Raw -LiteralPath $userInstallerRun.Log).Contains($userInstallerSummary.TrimEnd())) 'CMD and saved TXT agree on the corrected installer result'
+    Assert-Equal (@(Get-ChildItem -LiteralPath (Split-Path -Parent $userInstallerPath) -Force -Filter '.release-checker-*').Count) 0 'The corrected installer update cleans its staging and backup files'
+    $userInstallerHash = (Get-FileHash -LiteralPath $userInstallerPath).Hash
+    $userInstallerTime = [IO.File]::GetLastWriteTimeUtc($userInstallerPath)
+    $userInstallerRerun = Run-Cli @('-ReleasePath', $userInstallerRoot, '-MasterPath', 'sql\master.sql') 'installer-fcntl-import-rerun' $true
+    Assert-Equal $userInstallerRerun.ExitCode 0 'The supplied header succeeds again after its hotfix value already matches'
+    Assert-Equal (Get-FileHash -LiteralPath $userInstallerPath).Hash $userInstallerHash 'A rerun of the supplied header preserves installer bytes'
+    Assert-Equal ([IO.File]::GetLastWriteTimeUtc($userInstallerPath).Ticks) $userInstallerTime.Ticks 'A rerun of the supplied header preserves the installer timestamp'
+    Assert-True ((Get-Content -Raw -LiteralPath $userInstallerRerun.SummaryPath) -notmatch 'Installer updated:|Installer update failed:') 'An already matching supplied header emits no redundant installer message'
+    foreach ($importCase in @(
+        @('Basename', 'use File::Basename qw(dirname basename);'),
+        @('Whitespace', "`tuse Fcntl`tqw ( :DEFAULT`t:flock ); # keep comment with 'quotes'"),
+        @('Empty', 'use File::Copy qw();'),
+        @('Symbols', 'use Some::Module_2 qw(:tag CONSTANT_1 symbol2);')
+    )) {
+        $importRoot = New-TestRelease ('Installer-import-' + $importCase[0]) 'select 1 from dual;' @{
+            'v12hotfixinstall\v12hotfixinstall.pl' = ($importCase[1] + "`n" + 'my $hotfix = "OLD";')
+        }
+        $importPath = Join-Path $importRoot 'v12hotfixinstall\v12hotfixinstall.pl'
+        $importOriginal = [IO.File]::ReadAllText($importPath)
+        Assert-Equal (Audit-Path $importRoot).InstallerStatus 'Updated' 'Complete one-line literal import lists are safe to skip'
+        Assert-Equal ([IO.File]::ReadAllText($importPath)) ($importOriginal.Replace('my $hotfix = "OLD";', ('my $hotfix = "Installer-import-' + $importCase[0] + '";'))) 'Literal import contents and comments are preserved exactly'
+        Assert-Equal (Audit-Path $importRoot).InstallerStatus 'AlreadyMatches' 'Literal import support preserves no-op behavior'
+    }
     foreach ($badInstaller in @(
         @('Missing-assignment', 'my $different = "OLD";'),
-        @('Duplicate-assignment', ('my $hotfix = "ONE";' + "`n" + 'my $hotfix = "TWO";'))
+        @('Duplicate-assignment', ('my $hotfix = "ONE";' + "`n" + 'my $hotfix = "TWO";')),
+        @('POD-only', "=pod`nmy `$hotfix = `"EXAMPLE`";`n=cut`n"),
+        @('DATA-only', "__DATA__`nmy `$hotfix = `"EXAMPLE`";`n"),
+        @('END-only', "__END__`nmy `$hotfix = `"EXAMPLE`";`n"),
+        @('String-only', "my `$example = `"text`nmy `$hotfix = 'EXAMPLE';`ntext`";`n"),
+        @('Backticks-only', "my `$example = ``text`nmy `$hotfix = 'EXAMPLE';`ntext``;`n"),
+        @('Heredoc-only', "print <<'EXAMPLE';`nmy `$hotfix = `"EXAMPLE`";`nEXAMPLE`n"),
+        @('Quote-operator', "my `$example = q{`nmy `$hotfix = `"EXAMPLE`";`n};`n"),
+        @('Quote-word-delimiter', "my `$example = q X`nmy `$hotfix = `"EXAMPLE`";`nX;`n"),
+        @('Quote-nextline-delimiter', "my `$example = q`n{`nmy `$hotfix = `"EXAMPLE`";`n};`n"),
+        @('Import-multiline-example', "use Fcntl qw(`nmy `$hotfix = `"EXAMPLE`";`n);`n"),
+        @('Import-trailing-code', "use Fcntl qw(:DEFAULT :flock); my `$example = q{`nmy `$hotfix = `"EXAMPLE`";`n};`n"),
+        @('Import-unclosed-list', "use Fcntl qw(:DEFAULT :flock;`nmy `$hotfix = `"EXAMPLE`";`n"),
+        @('Regex-operator', "my `$example = m{`nmy `$hotfix = `"EXAMPLE`";`n};`n"),
+        @('Regex-literal', "my `$example = /`nmy `$hotfix = `"EXAMPLE`";`n/;`n"),
+        @('Format', "format STDOUT =`nmy `$hotfix = `"EXAMPLE`";`n.`n")
     )) {
         $badInstallerRoot = New-TestRelease ('Installer-' + $badInstaller[0]) 'select 1 from dual;' @{ 'v12hotfixinstall\v12hotfixinstall.pl' = $badInstaller[1] }
         $badInstallerPath = Join-Path $badInstallerRoot 'v12hotfixinstall\v12hotfixinstall.pl'
@@ -212,7 +420,90 @@ my $other = "OLD_HOTFIX_NAME_LONGER_THAN_THE_NEW_ONE_1234567890";
         Assert-Equal $badInstallerAudit.InstallerStatus 'Failed' 'An ambiguous or missing assignment is reported without guessing'
         Assert-Equal $badInstallerAudit.ExitCode 2 'An installer update failure makes the run incomplete'
         Assert-Equal (Get-FileHash -LiteralPath $badInstallerPath -Algorithm SHA256).Hash $badInstallerHash 'Rejected installer content is never rewritten'
+        if ($badInstaller[0] -eq 'Import-multiline-example') {
+            Assert-True ($badInstallerAudit.InstallerNote -match 'line 1, column 11') 'Unsupported installer syntax identifies its exact source line and column'
+        }
     }
+    foreach ($context in @(
+        @('POD', "=pod`nmy `$hotfix = `"EXAMPLE`";`n=cut`n", ''),
+        @('Multiline-string', "my `$example = `"text`nmy `$hotfix = 'EXAMPLE';`ntext`";`n", ''),
+        @('DATA', '', "`n__DATA__`nmy `$hotfix = `"EXAMPLE`";`n"),
+        @('END', '', "`n__END__`nmy `$hotfix = `"EXAMPLE`";`n"),
+        @('CR-only', "# header`r", "`r# footer")
+    )) {
+        $contextName = 'Installer-context-' + $context[0]
+        $contextText = $context[1] + 'my $hotfix = "OLD";' + $context[2]
+        $contextRoot = New-TestRelease $contextName 'select 1 from dual;' @{ 'v12hotfixinstall\v12hotfixinstall.pl' = $contextText }
+        $contextFile = Join-Path $contextRoot 'v12hotfixinstall\v12hotfixinstall.pl'
+        $contextOriginal = [IO.File]::ReadAllText($contextFile)
+        $contextAudit = Audit-Path $contextRoot
+        Assert-Equal $contextAudit.InstallerStatus 'Updated' 'An unambiguous active assignment can be updated around comments, strings or data sections'
+        Assert-Equal ([IO.File]::ReadAllText($contextFile)) ($contextOriginal.Replace('my $hotfix = "OLD";', ('my $hotfix = "' + $contextName + '";'))) 'Embedded examples and all surrounding text retain their exact contents'
+        Assert-Equal (Audit-Path $contextRoot).InstallerStatus 'AlreadyMatches' 'Context-aware installer editing remains idempotent'
+    }
+    $quotedRoot = New-TestRelease 'Installer-quote''s-$x-@y' 'select 1 from dual;' @{ 'v12hotfixinstall\v12hotfixinstall.pl' = 'my $hotfix = ''OLD\''QUOTE'';' }
+    $quotedFile = Join-Path $quotedRoot 'v12hotfixinstall\v12hotfixinstall.pl'
+    Assert-Equal (Audit-Path $quotedRoot).InstallerStatus 'Updated' 'Escaped quotes in a single-quoted installer value are recognized'
+    Assert-Equal ([IO.File]::ReadAllText($quotedFile).Trim()) 'my $hotfix = ''Installer-quote\''s-$x-@y'';' 'The replacement preserves literal Perl metacharacters and escapes the delimiter'
+    Assert-Equal (Audit-Path $quotedRoot).InstallerStatus 'AlreadyMatches' 'Escaped values are recognized on subsequent runs'
+    [IO.File]::WriteAllText($quotedFile, 'my $hotfix = "OLD\"QUOTE";')
+    Assert-Equal (Audit-Path $quotedRoot).InstallerStatus 'Updated' 'Escaped quotes in a double-quoted installer value are recognized'
+    Assert-Equal ([IO.File]::ReadAllText($quotedFile)) 'my $hotfix = "Installer-quote''s-\$x-\@y";' 'Double-quoted replacement escapes Perl interpolation characters'
+    Assert-Equal (Audit-Path $quotedRoot).InstallerStatus 'AlreadyMatches' 'Escaped double-quoted values remain idempotent'
+
+    $storedName = 'V12-023-2-02-HF-MiXeD-21'
+    $storedRoot = New-TestRelease $storedName 'select 1 from dual;' @{
+        'v12hotfixinstall\v12hotfixinstall.pl' = 'my $hotfix = "OLD";'
+        'sql\V12-old.last.perl' = 'hook bytes'
+        'documentation\V12-old.docx' = 'document bytes'
+    }
+    $lowerRoot = $storedRoot.ToLowerInvariant()
+    Assert-Equal (Get-HotfixName $lowerRoot) $storedName 'Hotfix naming uses the filesystem spelling instead of the caller path casing'
+    $storedAudit = Audit-Path $lowerRoot
+    Assert-Equal $storedAudit.InstallerStatus 'Updated' 'An installer can be synchronized through a differently cased root path'
+    Assert-Equal ([IO.File]::ReadAllText((Join-Path $storedRoot 'v12hotfixinstall\v12hotfixinstall.pl')).Trim()) ('my $hotfix = "' + $storedName + '";') 'Installer uses the stored hotfix name'
+    Assert-Equal (@(Get-ChildItem -LiteralPath (Join-Path $storedRoot 'sql') -Filter '*.perl')[0].Name) ($storedName + '.last.perl') 'Hook rename uses the stored folder spelling'
+    Assert-Equal (@(Get-ChildItem -LiteralPath (Join-Path $storedRoot 'documentation') -Filter '*.docx')[0].Name) ($storedName + '.docx') 'Documentation rename uses the stored folder spelling'
+
+    $lockedRoot = New-TestRelease 'Installer-locked' 'select 1 from dual;' @{ 'v12hotfixinstall\v12hotfixinstall.pl' = 'my $hotfix = "OLD";' }
+    $lockedFile = Join-Path $lockedRoot 'v12hotfixinstall\v12hotfixinstall.pl'
+    $lockedHash = (Get-FileHash -LiteralPath $lockedFile).Hash
+    $lockStream = [IO.File]::Open($lockedFile, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    try {
+        $lockedAudit = Audit-Path $lockedRoot
+        Assert-Equal $lockedAudit.InstallerStatus 'Failed' 'A sharing conflict prevents replacing the installer'
+        Assert-Equal $lockedAudit.ExitCode 2 'A blocked installer replacement is reported as incomplete'
+        Assert-Equal (Get-FileHash -LiteralPath $lockedFile).Hash $lockedHash 'A failed replacement preserves the complete original installer'
+        Assert-Equal (@(Get-ChildItem -LiteralPath (Split-Path -Parent $lockedFile) -Force -Filter '.release-checker-*').Count) 0 'Failed replacement removes the staged file'
+    } finally { $lockStream.Dispose() }
+    Assert-Equal (Audit-Path $lockedRoot).InstallerStatus 'Updated' 'An installer can be retried after the competing file handle closes'
+    Assert-Equal (@(Get-ChildItem -LiteralPath (Split-Path -Parent $lockedFile) -Force -Filter '.release-checker-*').Count) 0 'Successful replacement leaves no staged files'
+
+    $recoveryRoot = New-TestRelease 'Installer-recovery' 'select 1 from dual;' @{ 'v12hotfixinstall\v12hotfixinstall.pl' = 'my $hotfix = "OLD";' }
+    $recoveryFile = Join-Path $recoveryRoot 'v12hotfixinstall\v12hotfixinstall.pl'
+    $recoveryHash = (Get-FileHash -LiteralPath $recoveryFile).Hash
+    $replaceImplementation = ${function:Complete-InstallerReplacement}
+    try {
+        # Fault injection models the documented Windows partial-replacement
+        # failure: original moved to backup, replacement not yet moved in.
+        function Complete-InstallerReplacement([string]$Temporary, [string]$Destination, [string]$Backup) {
+            [IO.File]::Move($Destination, $Backup)
+            throw 'Simulated replacement failure after moving the original.'
+        }
+        $recoveryAudit = Audit-Path $recoveryRoot
+        Assert-Equal $recoveryAudit.InstallerStatus 'Failed' 'A partial filesystem replacement is explicitly reported as failed'
+        Assert-Equal $recoveryAudit.ExitCode 2 'A partial replacement cannot be reported as a successful audit'
+        Assert-True (-not (Test-Path -LiteralPath $recoveryFile)) 'The failure simulation reached the missing-original-path state'
+        $recoveryFolder = Split-Path -Parent $recoveryFile
+        $savedOriginal = @(Get-ChildItem -LiteralPath $recoveryFolder -Force -Filter '.release-checker-*.bak')
+        $savedReplacement = @(Get-ChildItem -LiteralPath $recoveryFolder -Force -Filter '.release-checker-*.tmp')
+        Assert-Equal $savedOriginal.Count 1 'A partial replacement retains the original backup'
+        Assert-Equal $savedReplacement.Count 1 'A partial replacement retains the prepared replacement'
+        Assert-Equal (Get-FileHash -LiteralPath $savedOriginal[0].FullName).Hash $recoveryHash 'Recovery preserves every byte of the original installer'
+        Assert-Equal ([IO.File]::ReadAllText($savedReplacement[0].FullName).Trim()) 'my $hotfix = "Installer-recovery";' 'The complete prepared installer is also recoverable'
+        Assert-True ($recoveryAudit.InstallerNote.Contains($savedOriginal[0].FullName) -and $recoveryAudit.InstallerNote.Contains($savedReplacement[0].FullName)) 'The failure summary identifies both recovery paths'
+        Assert-True ((Get-CoverageSummary $recoveryAudit).Contains('Recovery files were preserved')) 'Recovery instructions reach the normal user summary'
+    } finally { ${function:Complete-InstallerReplacement} = $replaceImplementation }
     $matchingAttributes = [IO.File]::GetAttributes($installerFile)
     try {
         [IO.File]::SetAttributes($installerFile, ($matchingAttributes -bor [IO.FileAttributes]::ReadOnly))
@@ -415,7 +706,7 @@ start support.txt
     Assert-Equal @($presenceAudit.MasterCalls | Where-Object { $_.Target -match 'commented_missing|output_missing|literal_missing' }).Count 0 'Comments, output and SQL literals never become missing calls'
     Assert-Equal $presenceAudit.Counts['Files not directly referenced'] 0 'Missing targets do not change successful folder-to-master coverage'
     $presenceSummary = Get-CoverageSummary $presenceAudit
-    Assert-True ($presenceSummary -match '(?s)Files with no matching call in the master:.*Master call file check') 'Presence section follows the existing coverage section'
+    Assert-True ($presenceSummary -match '(?s)Files with no matching call in the master.*Master call file check') 'Presence section follows the existing coverage section'
     Assert-True ($presenceSummary -match 'missing_required.pb \(line 11\)' -and $presenceSummary -match 'wrong\\payload.pb \(line 12\)') 'Missing files include their exact master line numbers'
 
     $allowedPresentRoot = New-TestRelease 'Allowed target supplied' '@DBDEFINE.SQL' @{ 'docs\dbdefine.sql' = 'select 1 from dual;' }
@@ -659,6 +950,36 @@ start support.txt
     $cleanSummary = Get-Content -Raw -LiteralPath $cleanRun.SummaryPath
     Assert-True ($cleanSummary -match 'Result: YES - all checked files are called by the master\.' -and $cleanSummary -match 'Files called by master: 1' -and $cleanSummary -match 'Files with no matching call: 0') 'Clean summary directly answers file coverage'
     Assert-True ((Get-Content -Raw -LiteralPath $cleanRun.Log).Contains($cleanSummary.TrimEnd())) 'CMD prints the same summary saved in the TXT'
+    Assert-True ($cleanSummary -match '0KB files were not found\.') 'A real clean CMD run explicitly reports no zero-byte files'
+    $zeroRun = Run-Cli @('-ReleasePath', $zeroRoot, '-MasterPath', 'sql\master.sql') 'zero-byte-cmd' $true
+    Assert-Equal $zeroRun.ExitCode 1 'Normal CMD mode keeps zero-byte findings even when call coverage passes'
+    Assert-True ((Get-Content -Raw -LiteralPath $zeroRun.SummaryPath) -match '0KB files found: 7') 'Real CMD output includes the recursive zero-byte count'
+    $ignoredZeroRun = Run-Cli @('-ReleasePath', $ignoredOnlyRoot, '-MasterPath', 'sql\master.sql') 'ignored-zero-byte-cmd' $true
+    Assert-Equal $ignoredZeroRun.ExitCode 0 'The four ignored empty-file extensions do not fail a real CMD run'
+    $cliDocHotfix = 'V12-023-2-02-HF-ALC-07'
+    $cliDocRoot = New-TestRelease $cliDocHotfix ("@empty.sql`n@" + $cliDocHotfix + '.docx') @{
+        'sql\empty.sql' = 'placeholder'
+        'documentation\V12-022-2-02-HF-BLC-01.docx' = 'placeholder'
+        'documentation\Hotfix Installation Instructions for V12C.docx' = 'Keep the installation instructions.'
+    }
+    [IO.File]::WriteAllBytes((Join-Path $cliDocRoot 'sql\empty.sql'), [byte[]]@())
+    [IO.File]::WriteAllBytes((Join-Path $cliDocRoot 'documentation\V12-022-2-02-HF-BLC-01.docx'), [byte[]]@(80,75,3,4,0,255))
+    $cliDocHash = (Get-FileHash -LiteralPath (Join-Path $cliDocRoot 'documentation\V12-022-2-02-HF-BLC-01.docx') -Algorithm SHA256).Hash
+    $cliInstructions = Join-Path $cliDocRoot 'documentation\Hotfix Installation Instructions for V12C.docx'
+    $cliInstructionsHash = (Get-FileHash -LiteralPath $cliInstructions -Algorithm SHA256).Hash
+    $cliDocRun = Run-Cli @('-ReleasePath', $cliDocRoot, '-MasterPath', 'sql\master.sql') 'documentation-and-zero' $true
+    Assert-Equal $cliDocRun.ExitCode 1 'Real CMD mode renames the hotfix document and reports empty SQL files'
+    Assert-Equal (Get-FileHash -LiteralPath (Join-Path $cliDocRoot ('documentation\' + $cliDocHotfix + '.docx')) -Algorithm SHA256).Hash $cliDocHash 'Real CMD mode preserves document bytes while changing its release/build name'
+    Assert-Equal (Get-FileHash -LiteralPath $cliInstructions -Algorithm SHA256).Hash $cliInstructionsHash 'Real CMD mode leaves the installation instructions untouched'
+    $cliDocSummary = Get-Content -Raw -LiteralPath $cliDocRun.SummaryPath
+    Assert-True ($cliDocSummary -match 'Documentation renamed:' -and $cliDocSummary -match '0KB files found: 1' -and $cliDocSummary -match '(?m)^  sql\\empty.sql\r?$') 'The saved summary includes the DOCX rename and exact zero-byte path'
+    Assert-True ($cliDocSummary -match 'Required calls missing files: 0') 'Real master call resolution sees the renamed DOCX before checking targets'
+    Assert-True ((Get-Content -Raw -LiteralPath $cliDocRun.Log).Contains($cliDocSummary.TrimEnd())) 'CMD and TXT contain identical documentation and zero-byte results'
+    $cliDocDetailed = Run-Cli @('-ReleasePath', $cliDocRoot, '-MasterPath', 'sql\master.sql', '-DetailedReport') 'documentation-and-zero-details'
+    Assert-Equal $cliDocDetailed.ExitCode 1 'Detailed mode preserves zero-byte findings on a rerun'
+    $cliDocDetailedSummary = Get-Content -Raw -LiteralPath $cliDocDetailed.SummaryPath
+    Assert-True ($cliDocDetailedSummary -match '0KB file check' -and $cliDocDetailedSummary -notmatch 'Documentation renamed:') 'Detailed reruns retain zero-byte reporting without repeating an already matching DOCX rename'
+    Assert-True ((Get-Content -Raw -LiteralPath $cliDocDetailed.CombinedPath) -match '0KB files found: 1') 'Detailed combined totals include zero-byte findings'
     Assert-Equal (Split-Path -Leaf $cleanRun.SummaryPath) 'summary_Clean.txt' 'Normal summary filename uses the release folder name'
     Assert-True ((Split-Path -Leaf $cleanRun.Folder) -match '^\d{8}_\d{4}(AM|PM)_Clean$') 'Normal report folder has the requested readable date, time and hotfix name'
     $exampleHotfix = 'V12-020-2-02N-HF-AMI-16'
@@ -755,8 +1076,8 @@ start support.txt
     Assert-Equal $simplePartial.ExitCode 2 'Simple summary preserves incomplete coverage status'
     Assert-Equal @(Get-ChildItem -LiteralPath $simplePartial.Folder -File).Count 1 'Incomplete default run still creates only one TXT'
     Assert-True ($partialSummary -match 'Files checked: 27' -and $partialSummary -match 'Files called by master: 16' -and $partialSummary -match 'Files with no matching call: 11') 'Simple counts include every exact basename directly called in the master'
-    Assert-True ($partialSummary -match 'Some content or calls could not be checked' -and $partialSummary -notmatch 'Result: YES') 'Unresolved calls cannot produce a false clean result'
-    $partialList = ($partialSummary -split 'Files with no matching call in the master:\r?\n')[1] -split '\r?\n\r?\nMaster call file check' | Select-Object -First 1
+    Assert-True ($partialSummary -match 'Result: 11 file\(s\) have no matching call in the master\.' -and $partialSummary -notmatch 'Result: YES|Some content or calls could not be checked|File presence results are provisional') 'Incomplete summaries retain findings and omit the repeated status notes'
+    $partialList = ($partialSummary -split '(?m)^\*  Files with no matching call in the master +\*\r?\n\*+\r?\n')[1] -split '\r?\n\r?\n\*+\r?\n\*  Master call file check' | Select-Object -First 1
     Assert-Equal @($partialList -split '\r?\n' | Where-Object { $_.Trim() }).Count 11 'All 11 uncalled files appear once in the plain list'
     Assert-True ($partialList -match '(?m)^  sql\\subfolder\\indirect\.sql\r?$' -and $partialList -notmatch '(?m)^  sql\\py_post\.pb\r?$') 'List includes indirectly called files and excludes direct matches'
     $coveredExtras = New-TestRelease 'CoveredExtras' "@child.sql`n@child.sql`n@not-in-release.sql" @{ 'sql\child.sql' = 'select 1 from dual;' }
@@ -857,7 +1178,7 @@ start support.txt
     Assert-Equal @([regex]::Matches($interactive.Output, 'Already added:')).Count 2 'Duplicate entries are acknowledged and not added twice'
     # ConsoleHost does not emit Read-Host prompt text when stdin is redirected.
     Assert-True ($interactive.Output -match 'Press Enter on the empty prompt to continue to master selection') 'Accepted and duplicate inputs explain how to advance'
-    Assert-True ($interactive.Output -match 'Releases selected: 2\. Next, confirm or select a master for each release\.') 'Blank input advances to master selection with the correct release count'
+    Assert-True ($interactive.Output -match 'Releases selected: Next, confirm or select a master for each release\.') 'Blank input advances to master selection using the requested prompt'
     $autoRoot = New-TestRelease 'Auto master hotfix' '-- Decoy master, not the detected master.' @{
         'sql\AUTO MASTER HOTFIX.SQL' = '@payload.pb';
         'sql\payload.pb' = 'select 1 from dual;';
