@@ -1,19 +1,19 @@
 ﻿#requires -Version 5.1
 <#
 .SYNOPSIS
-Release Script Checker: static SQL*Plus reference auditing and hotfix file naming.
+Hotfix Checker: static SQL*Plus reference auditing and hotfix file naming.
 .DESCRIPTION
-No arguments starts the release/master selection workflow. Supplied releases and
-masters are paired by array position; relative master/working paths use the release
-root. Reports and this utility must be outside every supplied release.
-The installer my $hotfix assignment is synchronized with the release folder name.
+No arguments starts the hotfix/master selection workflow. Supplied hotfixes and
+masters are paired by array position; relative master/working paths use the hotfix
+root. Reports and this utility must be outside every supplied hotfix.
+The installer my $hotfix assignment is synchronized with the hotfix folder name.
 The five supported Perl/undeploy script filenames in sql are also synchronized.
 The documentation DOCX filename is synchronized, and zero-byte files are reported.
 Exit codes: 0 completed/no findings; 1 completed/findings; 2 incomplete or failed.
 #>
 [CmdletBinding()]
 param(
-    [string[]]$ReleasePath,
+    [string[]]$HotfixPath,
     [string[]]$MasterPath,
     [string[]]$WorkingDirectory,
     [switch]$IncludeNested,
@@ -166,10 +166,10 @@ function Update-AuditProgress($Audit, [string]$Message, [switch]$Force) {
 }
 
 function Get-PhysicalPath([string]$Path) {
-    if (-not ('ReleaseChecker.NativePaths' -as [type])) {
+    if (-not ('HotfixChecker.NativePaths' -as [type])) {
         Add-Type -TypeDefinition @'
 using System; using System.Text; using System.Runtime.InteropServices; using Microsoft.Win32.SafeHandles;
-namespace ReleaseChecker {
+namespace HotfixChecker {
     public static class NativePaths {
         [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
         static extern SafeFileHandle CreateFile(string path, uint access, uint share, IntPtr security, uint mode, uint flags, IntPtr template);
@@ -194,7 +194,7 @@ namespace ReleaseChecker {
         $cursor = [IO.Path]::GetDirectoryName($cursor.TrimEnd('\'))
         if (-not $cursor) { throw "Cannot determine the filesystem location: $Path" }
     }
-    return [ReleaseChecker.NativePaths]::Resolve($cursor).TrimEnd('\') + $suffix
+    return [HotfixChecker.NativePaths]::Resolve($cursor).TrimEnd('\') + $suffix
 }
 
 function Test-LocationInRoot([string]$Path, [string]$Root) {
@@ -204,7 +204,7 @@ function Test-LocationInRoot([string]$Path, [string]$Root) {
 
 function Assert-ReportLocation([string]$Path) {
     foreach ($audit in $script:ReportAudits) {
-        if ($audit.NormalizedRoot -and (Test-LocationInRoot $Path $audit.Root)) { throw "ReportDirectory must be outside ALL scanned releases: $($audit.Root)" }
+        if ($audit.NormalizedRoot -and (Test-LocationInRoot $Path $audit.Root)) { throw "ReportDirectory must be outside ALL scanned hotfixes: $($audit.Root)" }
     }
     Assert-NoPathLinks $Path
 }
@@ -240,7 +240,7 @@ function Get-HotfixName([string]$Root) {
     # handle resolves the stored name, including callers using an 8.3 alias.
     $path = if (Test-Path -LiteralPath $Root -PathType Container) { Get-PhysicalPath $Root } else { $Root }
     $name = ($path.TrimEnd('\', '/') -split '[\\/]')[-1]
-    if (-not $name) { return 'InvalidRelease' }
+    if (-not $name) { return 'InvalidHotfix' }
     return $name
 }
 
@@ -252,7 +252,7 @@ function Get-ReportTimestamp([datetime]$UtcNow = [datetime]::UtcNow) {
 
 function Get-ReportName([string]$Name) {
     $safe = [regex]::Replace($Name, '[\\/:*?"<>|\p{Cc}\p{Cf}]', '_').TrimEnd(' ', '.')
-    if (-not $safe) { return 'InvalidRelease' }
+    if (-not $safe) { return 'InvalidHotfix' }
     return $safe
 }
 
@@ -371,7 +371,7 @@ function Update-HotfixInstaller($Audit) {
         if ($null -ne $linkType -and $linkType.Value -eq 'HardLink') { throw 'Installer has multiple hardlinks; refusing to modify another file through an alias.' }
         # Prepare and flush a complete sibling first. Replacement never truncates
         # the live installer and does not fall back to an in-place write.
-        $temporary = Join-Path ([IO.Path]::GetDirectoryName($path)) ('.release-checker-' + [guid]::NewGuid().ToString('N') + '.tmp')
+        $temporary = Join-Path ([IO.Path]::GetDirectoryName($path)) ('.hotfix-checker-' + [guid]::NewGuid().ToString('N') + '.tmp')
         $backup = [IO.Path]::ChangeExtension($temporary, '.bak')
         $stream = $null; $staging = $null; $created = $false
         try {
@@ -566,7 +566,7 @@ function Get-Inventory($Audit) {
         $items = @(Get-ChildItem -LiteralPath $directory -Force -ErrorAction SilentlyContinue -ErrorVariable readErrors)
         foreach ($e in $readErrors) { $complete = $false; Add-Issue $Audit "Directory read error: $e" $directory }
         foreach ($item in $items) {
-            if ($Audit.Files.Count % 250 -eq 0) { Update-AuditProgress $Audit ('Indexing release files: ' + $Audit.Files.Count + ' found') }
+            if ($Audit.Files.Count % 250 -eq 0) { Update-AuditProgress $Audit ('Indexing hotfix files: ' + $Audit.Files.Count + ' found') }
             $isLink = Test-PathLink $item
             if ($item.PSIsContainer) {
                 if ($isLink) { $complete = $false; Add-Issue $Audit 'Directory link skipped; inventory is incomplete.' $item.FullName }
@@ -728,7 +728,7 @@ function Read-Script([string]$Path, $Audit = $null) {
             } else {
                 $message = 'Encoding error (' + $encoding.WebName + '): ' + $decodeError.Message
                 if ($offset -eq 0 -and $codePage -eq 65001) {
-                    $message += ' If this is a legacy Windows ANSI script, rerun Check-Release.bat -ScriptEncoding Default; use -ScriptEncoding Windows1252 for a known Western Windows-1252 file. No encoding was guessed and no source was changed.'
+                    $message += ' If this is a legacy Windows ANSI script, rerun Hotfix-Checker.bat -ScriptEncoding Default; use -ScriptEncoding Windows1252 for a known Western Windows-1252 file. No encoding was guessed and no source was changed.'
                 } else { $message += ' Check the file encoding; a Unicode BOM overrides -ScriptEncoding.' }
                 throw $message
             }
@@ -803,7 +803,7 @@ function Read-Script([string]$Path, $Audit = $null) {
 
 function Resolve-Call($Call, $Audit, [string]$Chain, [bool]$Direct) {
     $r = [pscustomobject]@{
-        ReleaseRoot = $Audit.Root; SelectedMaster = $Audit.Master; SourceFile = $Call.SourceFile
+        HotfixRoot = $Audit.Root; SelectedMaster = $Audit.Master; SourceFile = $Call.SourceFile
         LineNumber = $Call.LineNumber; SourceText = $Call.SourceText; Command = $Call.Command
         Target = $Call.Target; Arguments = $Call.Arguments; Direct = $Direct
         Status = 'Unresolved'; MatchingMethod = ''; ResolvedPath = ''; Candidates = ''
@@ -814,7 +814,7 @@ function Resolve-Call($Call, $Audit, [string]$Chain, [bool]$Direct) {
     }
     if ($Call.ParseError) { $r.Notes = $Call.ParseError; return $r }
     if ($Call.Target -match '^[A-Za-z][A-Za-z0-9+.-]*://') {
-        $r.Status = 'OutsideRelease'; $r.Notes = 'External URL; not fetched or checked.'; return $r
+        $r.Status = 'OutsideHotfix'; $r.Notes = 'External URL; not fetched or checked.'; return $r
     }
     $target = $Call.Target.Replace('/', '\')
     if (-not $target -or $target -match '[&%$`*?]|\|\||["<>]' -or $target -match '^[A-Za-z]:[^\\]|^[A-Za-z]:$') {
@@ -831,8 +831,8 @@ function Resolve-Call($Call, $Audit, [string]$Chain, [bool]$Direct) {
         $explicitPath = ($target -match '[\\/:]')
         if (-not (Test-InRoot $path $Audit.Root)) {
             if ($explicitPath) {
-                $r.Status = 'OutsideRelease'; $r.ResolvedPath = $path
-                $r.Notes += 'Outside scanned release; existence elsewhere is not checked.'; return $r
+                $r.Status = 'OutsideHotfix'; $r.ResolvedPath = $path
+                $r.Notes += 'Outside scanned hotfix; existence elsewhere is not checked.'; return $r
             }
             # A bare filename still permits an explicitly labeled inventory match.
         } elseif ($Audit.ByPath.ContainsKey($path)) {
@@ -853,7 +853,7 @@ function Resolve-Call($Call, $Audit, [string]$Chain, [bool]$Direct) {
                     $r.Notes += 'Multiple filenames and no matching path context; none counted as called.'
                 }
             } else {
-                $r.Status = 'MissingInRelease'; $r.ResolvedPath = $path
+                $r.Status = 'MissingInHotfix'; $r.ResolvedPath = $path
                 $r.Notes += 'Not found in scanned inventory; explicit paths never use basename fallback.'
             }
         }
@@ -888,14 +888,14 @@ function Visit-Script($Audit, [string]$Path, [string[]]$Stack, [string]$Chain) {
         $primary = Resolve-Call $call $Audit $edgeChain (Test-SamePath $Path $Audit.Master)
         # Only literal master calls with a normalized filesystem target qualify.
         # Dynamic/malformed targets and unsupported invocations still need review.
-        if ($primary.Direct -and $primary.Status -in @('MissingInRelease', 'OutsideRelease') -and
+        if ($primary.Direct -and $primary.Status -in @('MissingInHotfix', 'OutsideHotfix') -and
             $primary.ResolvedPath -and $script:AllowedMissingCallNames.ContainsKey([IO.Path]::GetFileName($primary.ResolvedPath))) {
             $primary.Status = 'IgnoredMissing'
             $primary.Notes += ' Missing from hotfix is allowed by AllowedMissingCallTargets.'
         }
         $references = @($primary)
         # Direct coverage asks whether the filename is called by the master.
-        # Bare START/@ names cover every exact basename in the release. Explicit
+        # Bare START/@ names cover every exact basename in the hotfix. Explicit
         # paths and @@ keep path resolution; nested reads use only the primary.
         if ($primary.Direct -and $call.Command -ne '@@' -and $call.Target -notmatch '[\\/:]' -and
             $primary.Status -in @('Resolved', 'Ambiguous')) {
@@ -909,7 +909,7 @@ function Visit-Script($Audit, [string]$Path, [string[]]$Stack, [string]$Chain) {
                     $match.Status = if ($copy.IsLink) { 'Unresolved' } else { 'Resolved' }
                     $match.MatchingMethod = 'FilenamePresence'
                     $match.Candidates = $copies.FullPath -join ' | '
-                    $match.Notes = 'Exact filename called in the master; multiple release copies match. This does not establish which copy SQL*Plus executes.'
+                    $match.Notes = 'Exact filename called in the master; multiple hotfix copies match. This does not establish which copy SQL*Plus executes.'
                     $match
                 }
                 if ($Audit.Nested -and $primary.Status -ne 'Resolved') {
@@ -945,7 +945,7 @@ function Get-MasterCallChecks($Audit) {
     foreach ($group in @($Audit.References | Where-Object { $_.Direct -and $_.Command -in @('START', '@', '@@') } | Group-Object LineNumber | Sort-Object { [int]$_.Name })) {
         $refs = @($group.Group)
         $status = if (@($refs | Where-Object { $_.Status -eq 'IgnoredMissing' }).Count) { 'IgnoredMissing' }
-            elseif (@($refs | Where-Object { $_.Status -in @('MissingInRelease', 'OutsideRelease') }).Count) { 'Missing' }
+            elseif (@($refs | Where-Object { $_.Status -in @('MissingInHotfix', 'OutsideHotfix') }).Count) { 'Missing' }
             elseif (@($refs | Where-Object { $_.Status -ne 'Resolved' }).Count) { 'Review' }
             else { 'Present' }
         [pscustomobject]@{ Target = $refs[0].Target; LineNumber = $refs[0].LineNumber; PresenceStatus = $status }
@@ -974,10 +974,10 @@ function New-Audit([string]$Root, [string]$Master, [string]$Working, [bool]$Nest
 function Invoke-Audit($Audit) {
     try {
         if ($Audit.InputError) { throw $Audit.InputError }
-        Update-AuditProgress $Audit 'Validating release and master paths...' -Force
+        Update-AuditProgress $Audit 'Validating hotfix and master paths...' -Force
         Assert-NoPathLinks $Audit.Root
-        if (-not (Test-Path -LiteralPath $Audit.Root -PathType Container)) { throw 'Release directory does not exist or is inaccessible.' }
-        if (-not (Test-InRoot $Audit.Master $Audit.Root)) { throw 'Selected master must be within this release.' }
+        if (-not (Test-Path -LiteralPath $Audit.Root -PathType Container)) { throw 'Hotfix directory does not exist or is inaccessible.' }
+        if (-not (Test-InRoot $Audit.Master $Audit.Root)) { throw 'Selected master must be within this hotfix.' }
         if ([IO.Path]::GetExtension($Audit.Master) -ine '.sql') { throw 'Selected master must be a .sql file.' }
         Assert-NoPathLinks $Audit.Master
         if (-not (Test-Path -LiteralPath $Audit.Master -PathType Leaf)) { throw 'Selected master does not exist or is inaccessible.' }
@@ -985,7 +985,7 @@ function Invoke-Audit($Audit) {
         Assert-NoPathLinks $Audit.WorkingDirectory
         Rename-HotfixScripts $Audit
         Rename-HotfixDocumentation $Audit
-        Update-AuditProgress $Audit 'Scanning release folders...' -Force
+        Update-AuditProgress $Audit 'Scanning hotfix folders...' -Force
         Get-Inventory $Audit
         Update-AuditProgress $Audit ('Inventory complete: ' + $Audit.Files.Count + ' files found.') -Force
         if (-not $Audit.ByPath.ContainsKey($Audit.Master)) { throw 'Selected master was not accessible in the inventory.' }
@@ -1030,7 +1030,7 @@ function Invoke-Audit($Audit) {
         if ($ambiguous.Count) { $notes += 'Candidate for ambiguous call(s): ' + (($ambiguous | ForEach-Object { $_.SourceFile + ':' + $_.LineNumber }) -join ' | ') }
         if ($file.IsLink) { $notes += 'File link skipped; review manually.' }
         [pscustomobject]@{
-            ReleaseRoot = $Audit.Root; SelectedMaster = $Audit.Master; RelativeFilePath = $file.RelativePath
+            HotfixRoot = $Audit.Root; SelectedMaster = $Audit.Master; RelativeFilePath = $file.RelativePath
             Extension = $(if ($file.Extension) { $file.Extension } else { '(none)' })
             DirectReferenceStatus = $(if ($direct.Count) { 'DirectlyReferenced' } elseif (@($ambiguous | Where-Object { $_.Direct }).Count) { 'Ambiguous' } else { 'NoDirectReferenceFound' })
             IndirectReferenceStatus = $(if (-not $Audit.Nested) { 'NotChecked' } elseif ($indirect.Count) { 'IndirectlyReferenced' } elseif (@($ambiguous | Where-Object { -not $_.Direct }).Count) { 'Ambiguous' } else { 'NoIndirectReferenceFound' })
@@ -1071,7 +1071,7 @@ function Get-AuditCounts($Audit) {
         'Files referenced only indirectly' = @($Audit.Rows | Where-Object { $_.DirectReferenceStatus -ne 'DirectlyReferenced' -and $_.IndirectReferenceStatus -eq 'IndirectlyReferenced' }).Count
     }
     foreach ($entry in @(@('Ambiguous references', 'Ambiguous'), @('Unresolved references', 'Unresolved'),
-        @('Unsupported invocations', 'Unsupported'), @('Call targets not found within scanned release', 'MissingInRelease'), @('References outside scanned release', 'OutsideRelease'))) {
+        @('Unsupported invocations', 'Unsupported'), @('Call targets not found within scanned hotfix', 'MissingInHotfix'), @('References outside scanned hotfix', 'OutsideHotfix'))) {
         $counts[$entry[0]] = @($Audit.References | Where-Object { $_.Status -eq $entry[1] }).Count
     }
     $counts['Master calls checked'] = $Audit.MasterCalls.Count
@@ -1090,7 +1090,7 @@ function Get-MasterCallSummary($Audit) {
     $s = New-Object 'System.Collections.Generic.List[string]'
     $s.Add((Get-SectionBanner 'Master call file check (hotfix folder)'))
     if (-not $Audit.MasterReadable) {
-        $s.Add('File presence result: COULD NOT CHECK - the release or master could not be read.')
+        $s.Add('File presence result: COULD NOT CHECK - the hotfix or master could not be read.')
         return ($s -join [Environment]::NewLine)
     }
     $missing = @($Audit.MasterCalls | Where-Object { $_.PresenceStatus -eq 'Missing' })
@@ -1134,7 +1134,7 @@ function Get-ZeroByteSummary($Audit) {
 function Get-CoverageSummary($Audit) {
     $s = New-Object 'System.Collections.Generic.List[string]'
     $s.Add('Executed by: ' + (ConvertTo-SafeText $Audit.ExecutedBy))
-    $s.Add('Release: ' + (ConvertTo-SafeText $Audit.Root))
+    $s.Add('Hotfix: ' + (ConvertTo-SafeText $Audit.Root))
     $s.Add('Selected master: ' + (ConvertTo-SafeText $Audit.Master))
     if ($Audit.InstallerNote) { $s.Add((ConvertTo-SafeText $Audit.InstallerNote)) }
     foreach ($note in $Audit.ScriptRenameNotes) { $s.Add((ConvertTo-SafeText $note)) }
@@ -1143,10 +1143,10 @@ function Get-CoverageSummary($Audit) {
         $s.Add('Encoding fallback: ' + (ConvertTo-SafeText (Get-RelativePath $choice.SourceFile $Audit.Root)) + ' read as ' + $choice.Encoding + ' after invalid UTF-8.')
     }
     if (@($Audit.References | Where-Object { $_.MatchingMethod -eq 'FilenamePresence' }).Count) {
-        $s.Add('Matching: Bare filenames called in the master cover all exact-name copies across release folders; runtime path selection is not verified.')
+        $s.Add('Matching: Bare filenames called in the master cover all exact-name copies across hotfix folders; runtime path selection is not verified.')
     }
     if (-not $Audit.MasterReadable) {
-        $s.Add('Result: COULD NOT CHECK - the release or master could not be read.')
+        $s.Add('Result: COULD NOT CHECK - the hotfix or master could not be read.')
         if ($Audit.Issues.Count) { $s.Add('Reason: ' + (ConvertTo-SafeText $Audit.Issues[0].Message)) }
         $s.Add(''); $s.Add((Get-MasterCallSummary $Audit))
         $s.Add(''); $s.Add((Get-ZeroByteSummary $Audit))
@@ -1183,10 +1183,10 @@ function Get-CoverageSummary($Audit) {
 function Get-Summary($Audit) {
     $s = New-Object 'System.Collections.Generic.List[string]'
     $notDirect = @($Audit.Rows | Where-Object { $_.DirectReferenceStatus -ne 'DirectlyReferenced' })
-    $s.Add((Get-SectionBanner 'Release Script Checker'))
+    $s.Add((Get-SectionBanner 'Hotfix Checker'))
     $s.Add('Executed by: ' + (ConvertTo-SafeText $Audit.ExecutedBy))
-    $s.Add('Release: ' + (ConvertTo-SafeText $Audit.Root)); $s.Add('Selected master: ' + (ConvertTo-SafeText $Audit.Master))
-    $s.Add('Static references only; no release scripts were executed.')
+    $s.Add('Hotfix: ' + (ConvertTo-SafeText $Audit.Root)); $s.Add('Selected master: ' + (ConvertTo-SafeText $Audit.Master))
+    $s.Add('Static references only; no hotfix scripts were executed.')
     if ($Audit.InstallerNote) { $s.Add((ConvertTo-SafeText $Audit.InstallerNote)) }
     foreach ($note in $Audit.ScriptRenameNotes) { $s.Add((ConvertTo-SafeText $note)) }
     if ($Audit.DocumentationNote) { $s.Add((ConvertTo-SafeText $Audit.DocumentationNote)) }
@@ -1216,8 +1216,8 @@ function Get-Summary($Audit) {
     foreach ($section in @(
         @{ Title = 'Ambiguous references'; Status = @('Ambiguous') },
         @{ Title = 'Unresolved / manual review'; Status = @('Unresolved', 'Unsupported') },
-        @{ Title = 'Call targets not found within scanned release'; Status = @('MissingInRelease') },
-        @{ Title = 'References outside scanned release (not checked externally)'; Status = @('OutsideRelease') }
+        @{ Title = 'Call targets not found within scanned hotfix'; Status = @('MissingInHotfix') },
+        @{ Title = 'References outside scanned hotfix (not checked externally)'; Status = @('OutsideHotfix') }
     )) {
         $s.Add(''); $s.Add($section.Title + ':')
         $refs = @($Audit.References | Where-Object { $section.Status -contains $_.Status })
@@ -1288,7 +1288,7 @@ function Select-Master([string]$Root) {
         }
         Write-Console 'Select the master manually.'
     } else {
-        Write-Console ("`nNo master matching the release folder name was found. Select the master manually.")
+        Write-Console ("`nNo master matching the hotfix folder name was found. Select the master manually.")
     }
     $sqlRoot = Join-Path $Root 'sql'
     $sqlFiles = @()
@@ -1304,7 +1304,7 @@ function Select-Master([string]$Root) {
     }
     Write-Console "`nSelect the master for: $Root"
     for ($i = 0; $i -lt $sqlFiles.Count; $i++) { Write-Console ('  {0}. {1}' -f ($i + 1), $sqlFiles[$i].FullPath) }
-    Write-Console '  M. Enter a master .sql path manually (relative to release or absolute)'
+    Write-Console '  M. Enter a master .sql path manually (relative to hotfix or absolute)'
     while ($true) {
         $choice = Read-Host 'Master number, M, or a file path'
         $index = 0
@@ -1312,7 +1312,7 @@ function Select-Master([string]$Root) {
         if ($choice -ieq 'M') { $choice = Read-Host 'Master .sql path' }
         try {
             $master = Get-NormalPath $choice $Root
-            if (-not (Test-InRoot $master $Root) -or [IO.Path]::GetExtension($master) -ine '.sql') { throw 'Choose a .sql file inside this release.' }
+            if (-not (Test-InRoot $master $Root) -or [IO.Path]::GetExtension($master) -ine '.sql') { throw 'Choose a .sql file inside this hotfix.' }
             Assert-NoPathLinks $master
             if (-not (Test-Path -LiteralPath $master -PathType Leaf)) { throw 'File does not exist or is inaccessible.' }
             return $master
@@ -1322,74 +1322,74 @@ function Select-Master([string]$Root) {
 
 function Invoke-Checker {
     if ($Help) {
-        Write-Console 'Release Script Checker - Windows PowerShell 5.1'
-        Write-Console 'No arguments: release paths, automatic master detection and Y/N confirmation.'
-        Write-Console 'Parameters: -ReleasePath <paths> -MasterPath <paths> [-WorkingDirectory <paths>]'
+        Write-Console 'Hotfix Checker - Windows PowerShell 5.1'
+        Write-Console 'No arguments: hotfix paths, automatic master detection and Y/N confirmation.'
+        Write-Console 'Parameters: -HotfixPath <paths> -MasterPath <paths> [-WorkingDirectory <paths>]'
         Write-Console '            [-IncludeNested] [-ReportDirectory <path>] [-NonInteractive]'
         Write-Console '            [-DetailedReport] (optional CSVs and full call details)'
         Write-Console '            [-NoPause] (disable the final wait in an interactive script run)'
         Write-Console '            [-ScriptEncoding Auto|UTF8|Default|Windows1252|Unicode|BigEndianUnicode] [-MaxScriptSizeMB 64]'
-        Write-Console 'Alternative batch input: -InputCsv <csv> with ReleasePath,MasterPath,WorkingDirectory columns.'
+        Write-Console 'Alternative batch input: -InputCsv <csv> with HotfixPath,MasterPath,WorkingDirectory columns.'
         Write-Console 'See README.md for examples and exit codes (0 / 1 / 2).'
         return 0
     }
     $jobs = New-Object System.Collections.ArrayList
     if ($InputCsv) {
-        if ($ReleasePath -or $MasterPath -or $WorkingDirectory) { throw 'InputCsv cannot be combined with ReleasePath, MasterPath, or WorkingDirectory.' }
+        if ($HotfixPath -or $MasterPath -or $WorkingDirectory) { throw 'InputCsv cannot be combined with HotfixPath, MasterPath, or WorkingDirectory.' }
         $records = @(Import-Csv -LiteralPath $InputCsv)
-        if (-not $records.Count) { throw 'Input CSV has no release rows.' }
+        if (-not $records.Count) { throw 'Input CSV has no hotfix rows.' }
         foreach ($record in $records) {
-            if (-not $record.PSObject.Properties['ReleasePath'] -or -not $record.PSObject.Properties['MasterPath']) { throw 'CSV requires ReleasePath and MasterPath columns.' }
+            if (-not $record.PSObject.Properties['HotfixPath'] -or -not $record.PSObject.Properties['MasterPath']) { throw 'CSV requires HotfixPath and MasterPath columns.' }
             $wd = if ($record.PSObject.Properties['WorkingDirectory']) { $record.WorkingDirectory } else { '' }
-            [void]$jobs.Add(@{ Release = $record.ReleasePath; Master = $record.MasterPath; Working = $wd })
+            [void]$jobs.Add(@{ Hotfix = $record.HotfixPath; Master = $record.MasterPath; Working = $wd })
         }
-    } elseif ($ReleasePath -or $MasterPath -or $NonInteractive) {
-        if (-not $ReleasePath -or -not $MasterPath -or $ReleasePath.Count -ne $MasterPath.Count) { throw 'Supply one MasterPath for each ReleasePath; no prompts are used when paths are supplied.' }
-        if ($WorkingDirectory -and $WorkingDirectory.Count -ne 1 -and $WorkingDirectory.Count -ne $ReleasePath.Count) { throw 'WorkingDirectory must have one value, or one per release.' }
-        for ($i = 0; $i -lt $ReleasePath.Count; $i++) {
+    } elseif ($HotfixPath -or $MasterPath -or $NonInteractive) {
+        if (-not $HotfixPath -or -not $MasterPath -or $HotfixPath.Count -ne $MasterPath.Count) { throw 'Supply one MasterPath for each HotfixPath; no prompts are used when paths are supplied.' }
+        if ($WorkingDirectory -and $WorkingDirectory.Count -ne 1 -and $WorkingDirectory.Count -ne $HotfixPath.Count) { throw 'WorkingDirectory must have one value, or one per hotfix.' }
+        for ($i = 0; $i -lt $HotfixPath.Count; $i++) {
             $wd = if (-not $WorkingDirectory) { '' } elseif ($WorkingDirectory.Count -eq 1) { $WorkingDirectory[0] } else { $WorkingDirectory[$i] }
-            [void]$jobs.Add(@{ Release = $ReleasePath[$i]; Master = $MasterPath[$i]; Working = $wd })
+            [void]$jobs.Add(@{ Hotfix = $HotfixPath[$i]; Master = $MasterPath[$i]; Working = $wd })
         }
     } else {
-        Write-Console (Get-SectionBanner 'Release Script Checker - check file coverage and master call targets')
-        Write-Console 'Enter release folders one per line; submit a blank line when finished.'
+        Write-Console (Get-SectionBanner 'Hotfix Checker - check file coverage and master call targets')
+        Write-Console 'Enter hotfix folders one per line; submit a blank line when finished.'
         while ($true) {
-            $prompt = if ($jobs.Count) { 'Another release folder (press Enter to choose masters)' } else { 'Release folder' }
+            $prompt = if ($jobs.Count) { 'Another hotfix folder (press Enter to choose masters)' } else { 'Hotfix folder' }
             $entered = Read-Host $prompt
             if ([string]::IsNullOrWhiteSpace($entered)) { break }
             try {
                 $root = Get-NormalPath $entered
                 Assert-NoPathLinks $root
                 if (-not (Test-Path -LiteralPath $root -PathType Container)) { throw 'Directory does not exist or is inaccessible.' }
-                if (Test-InRoot $PSScriptRoot $root) { throw 'The utility must be outside the release folder.' }
-                if (@($jobs | Where-Object { Test-SamePath $_.Release $root }).Count) {
+                if (Test-InRoot $PSScriptRoot $root) { throw 'The utility must be outside the hotfix folder.' }
+                if (@($jobs | Where-Object { Test-SamePath $_.Hotfix $root }).Count) {
                     Write-Console ('Already added: ' + $root)
-                    Write-Console 'Press Enter on the empty prompt to continue to master selection, or enter a different release folder.'
+                    Write-Console 'Press Enter on the empty prompt to continue to master selection, or enter a different hotfix folder.'
                     continue
                 }
-                [void]$jobs.Add(@{ Release = $root; Master = ''; Working = '' })
-                Write-Console ('Added release: ' + $root)
-                Write-Console 'Press Enter on the empty prompt to continue to master selection, or enter another release folder.'
-            } catch { Write-Console ('Invalid release: ' + $_.Exception.Message) }
+                [void]$jobs.Add(@{ Hotfix = $root; Master = ''; Working = '' })
+                Write-Console ('Added hotfix: ' + $root)
+                Write-Console 'Press Enter on the empty prompt to continue to master selection, or enter another hotfix folder.'
+            } catch { Write-Console ('Invalid hotfix: ' + $_.Exception.Message) }
         }
-        if (-not $jobs.Count) { Write-Console 'No releases selected.'; return 2 }
-        Write-Console 'Releases selected: Next, confirm or select a master for each release.'
-        if ($WorkingDirectory -and $WorkingDirectory.Count -ne 1 -and $WorkingDirectory.Count -ne $jobs.Count) { throw 'WorkingDirectory must have one value, or one per release.' }
+        if (-not $jobs.Count) { Write-Console 'No hotfixes selected.'; return 2 }
+        Write-Console 'Hotfixes selected: Next, confirm or select a master for each hotfix.'
+        if ($WorkingDirectory -and $WorkingDirectory.Count -ne 1 -and $WorkingDirectory.Count -ne $jobs.Count) { throw 'WorkingDirectory must have one value, or one per hotfix.' }
         for ($i = 0; $i -lt $jobs.Count; $i++) {
-            $jobs[$i].Master = Select-Master $jobs[$i].Release
+            $jobs[$i].Master = Select-Master $jobs[$i].Hotfix
             if ($WorkingDirectory) { $jobs[$i].Working = if ($WorkingDirectory.Count -eq 1) { $WorkingDirectory[0] } else { $WorkingDirectory[$i] } }
         }
     }
     $audits = New-Object System.Collections.ArrayList
     foreach ($job in $jobs) {
-        $root = [string]$job.Release; $master = [string]$job.Master; $wd = [string]$job.Working
+        $root = [string]$job.Hotfix; $master = [string]$job.Master; $wd = [string]$job.Working
         $inputError = ''; $normalizedRoot = $false
         try {
-            $root = Get-NormalPath $job.Release; $normalizedRoot = $true
+            $root = Get-NormalPath $job.Hotfix; $normalizedRoot = $true
             $master = Get-NormalPath $job.Master $root
             $wd = if ($job.Working) { Get-NormalPath $job.Working $root } else { [IO.Path]::GetDirectoryName($master) }
-        } catch { $inputError = 'Invalid release/master/working path: ' + $_.Exception.Message }
-        if ($normalizedRoot -and (Test-LocationInRoot $PSScriptRoot $root)) { throw "Move the utility outside the scanned release: $root" }
+        } catch { $inputError = 'Invalid hotfix/master/working path: ' + $_.Exception.Message }
+        if ($normalizedRoot -and (Test-LocationInRoot $PSScriptRoot $root)) { throw "Move the utility outside the scanned hotfix: $root" }
         $audit = New-Audit $root $master $wd ([bool]$IncludeNested)
         $audit.InputError = $inputError; $audit.NormalizedRoot = $normalizedRoot
         [void]$audits.Add($audit)
@@ -1399,17 +1399,17 @@ function Invoke-Checker {
     $script:ReportAudits = @($audits)
     Assert-ReportLocation $reportRoot
     $timestamp = Get-ReportTimestamp
-    $fileColumns = @('ReleaseRoot', 'SelectedMaster', 'RelativeFilePath', 'Extension', 'DirectReferenceStatus', 'IndirectReferenceStatus', 'MatchingMethod', 'ReferenceSourceFile', 'SourceLineNumbers', 'NumberOfDetectedCalls', 'DirectCallCount', 'IndirectCallCount', 'CallChains', 'Notes', 'AuditStatus')
-    $refColumns = @('ReleaseRoot', 'SelectedMaster', 'SourceFile', 'LineNumber', 'SourceText', 'Command', 'Target', 'Arguments', 'Direct', 'Status', 'MatchingMethod', 'ResolvedPath', 'Candidates', 'CallChain', 'Notes', 'Cycle')
+    $fileColumns = @('HotfixRoot', 'SelectedMaster', 'RelativeFilePath', 'Extension', 'DirectReferenceStatus', 'IndirectReferenceStatus', 'MatchingMethod', 'ReferenceSourceFile', 'SourceLineNumbers', 'NumberOfDetectedCalls', 'DirectCallCount', 'IndirectCallCount', 'CallChains', 'Notes', 'AuditStatus')
+    $refColumns = @('HotfixRoot', 'SelectedMaster', 'SourceFile', 'LineNumber', 'SourceText', 'Command', 'Target', 'Arguments', 'Direct', 'Status', 'MatchingMethod', 'ResolvedPath', 'Candidates', 'CallChain', 'Notes', 'Cycle')
     $overall = 0; $index = 0
-    if ($audits.Count -gt 1) { Write-Console ('Releases checked: ' + $audits.Count) }
+    if ($audits.Count -gt 1) { Write-Console ('Hotfixes checked: ' + $audits.Count) }
     foreach ($audit in $audits) {
         $index++
         $name = Get-ReportName (Get-HotfixName $audit.Root)
         $runFolder = New-ReportFolder $reportRoot $timestamp $name
         $script:LastRunFolder = $runFolder
         $summaryPath = Join-Path $runFolder ('summary_' + $name + '.txt')
-        Write-Console ("`nChecking release: " + (ConvertTo-SafeText $audit.Root))
+        Write-Console ("`nChecking hotfix: " + (ConvertTo-SafeText $audit.Root))
         if ($DetailedReport) { Write-Console ('Selected master: ' + (ConvertTo-SafeText $audit.Master)) }
         $audit.ShowProgress = $true
         Invoke-Audit $audit
@@ -1419,7 +1419,7 @@ function Invoke-Checker {
             if ($audit.ExitCode -ne 2) {
                 $audit.ExitCode = if ($audit.Counts['Files not directly referenced'] -or $audit.Counts['Required calls missing files'] -or $audit.ZeroByteFiles.Count) { 1 } else { 0 }
             }
-            $summary = (Get-SectionBanner 'Release Script Checker') + [Environment]::NewLine + (Get-CoverageSummary $audit)
+            $summary = (Get-SectionBanner 'Hotfix Checker') + [Environment]::NewLine + (Get-CoverageSummary $audit)
             $summary += [Environment]::NewLine + [Environment]::NewLine + 'Summary saved to: ' + $summaryPath
             Write-Console '  Saving summary...'
             Write-ReportText $summaryPath @($summary)
@@ -1444,8 +1444,8 @@ function Invoke-Checker {
         if ($audit.ExitCode -gt $overall) { $overall = $audit.ExitCode }
     }
     if (-not $DetailedReport) { return $overall }
-    $totals = @((Get-SectionBanner 'Release Script Checker - combined totals'),
-        ('Executed by: ' + (ConvertTo-SafeText $audits[0].ExecutedBy)), ('Releases reviewed: ' + $audits.Count))
+    $totals = @((Get-SectionBanner 'Hotfix Checker - combined totals'),
+        ('Executed by: ' + (ConvertTo-SafeText $audits[0].ExecutedBy)), ('Hotfixes reviewed: ' + $audits.Count))
     foreach ($label in $audits[0].Counts.Keys) {
         $value = ($audits | ForEach-Object { $_.Counts[$label] } | Measure-Object -Sum).Sum
         if ($label -eq 'Files referenced only indirectly' -and -not $IncludeNested) { $value = 'Not checked (direct-only mode)' }
@@ -1453,10 +1453,10 @@ function Invoke-Checker {
             $value += ($audits | ForEach-Object { $_.Counts['Unsupported invocations'] } | Measure-Object -Sum).Sum
             $displayLabel = 'Unresolved / unsupported references'
         } elseif ($label -eq 'Unsupported invocations') { continue }
-        else { $displayLabel = $label.Replace('scanned release', 'scanned releases') }
+        else { $displayLabel = $label.Replace('scanned hotfix', 'scanned hotfixes') }
         $totals += $displayLabel + ': ' + $value
     }
-    $totals += 'Incomplete / failed releases: ' + @($audits | Where-Object { $_.ExitCode -eq 2 }).Count
+    $totals += 'Incomplete / failed hotfixes: ' + @($audits | Where-Object { $_.ExitCode -eq 2 }).Count
     $totals += 'Overall exit code: ' + $overall
     $totals = $totals -join [Environment]::NewLine
     if ($audits.Count -gt 1) {
@@ -1471,7 +1471,7 @@ function Invoke-Checker {
 
 # Dot sourcing exposes the functions to the built-in regression harness only.
 if ($MyInvocation.InvocationName -ne '.') {
-    $interactiveRun = (-not $ReleasePath -and -not $MasterPath -and -not $InputCsv -and -not $NonInteractive -and -not $Help)
+    $interactiveRun = (-not $HotfixPath -and -not $MasterPath -and -not $InputCsv -and -not $NonInteractive -and -not $Help)
     $script:LastRunFolder = ''
     $code = 2
     try { $code = Invoke-Checker }

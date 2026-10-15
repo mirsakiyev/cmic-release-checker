@@ -1,8 +1,8 @@
 #requires -Version 5.1
 # No Pester, modules, SQL*Plus, or third-party test dependencies are needed.
 $ErrorActionPreference = 'Stop'
-$checker = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\Check-Release.ps1'))
-$launcher = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\Check-Release.bat'))
+$checker = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\Hotfix-Checker.ps1'))
+$launcher = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\Hotfix-Checker.bat'))
 . $checker
 $testRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $fixtures = Join-Path $testRoot 'fixtures'
@@ -29,7 +29,7 @@ function Audit-Fixture([string]$Name, [bool]$Nested = $false, [string]$Working =
     Invoke-Audit $audit
     return $audit
 }
-function New-TestRelease([string]$Name, [string]$MasterText, [hashtable]$Files) {
+function New-TestHotfix([string]$Name, [string]$MasterText, [hashtable]$Files) {
     $root = Join-Path $work $Name
     [void](New-Item -ItemType Directory -Path (Join-Path $root 'sql') -Force)
     Set-Content -LiteralPath (Join-Path $root 'sql\master.sql') -Value $MasterText -Encoding UTF8
@@ -155,7 +155,7 @@ try {
     $ignoredZeroPaths = @('scripts\support.PL', 'scripts\support.PERL', 'scripts\support.UNDEPLOY', 'docs\notes.TxT')
     $zeroFiles = @{ 'data\one.dat' = 'placeholder'; 'archives\small.zip' = 'placeholder' }
     foreach ($relative in @($zeroPaths) + @($ignoredZeroPaths)) { $zeroFiles[$relative] = 'placeholder' }
-    $zeroRoot = New-TestRelease 'Zero-byte inventory' "@empty.sql`n@zero.dat`n@one.dat`n@support.pl.bak" $zeroFiles
+    $zeroRoot = New-TestHotfix 'Zero-byte inventory' "@empty.sql`n@zero.dat`n@one.dat`n@support.pl.bak" $zeroFiles
     foreach ($relative in @($zeroPaths) + @($ignoredZeroPaths)) { [IO.File]::WriteAllBytes((Join-Path $zeroRoot $relative), [byte[]]@()) }
     [IO.File]::WriteAllBytes((Join-Path $zeroRoot 'data\one.dat'), [byte[]]@(255))
     [IO.File]::WriteAllBytes((Join-Path $zeroRoot 'archives\small.zip'), [byte[]]@(1,2,3))
@@ -173,12 +173,12 @@ try {
     Assert-True ((Get-Summary $zeroAudit) -match '(?s)0KB file check.*0KB files found: 7') 'Detailed summaries include the same zero-byte check'
     $ignoredOnlyFiles = @{}
     foreach ($relative in $ignoredZeroPaths) { $ignoredOnlyFiles[$relative] = 'placeholder' }
-    $ignoredOnlyRoot = New-TestRelease 'Ignored zero-byte files' 'select 1 from dual;' $ignoredOnlyFiles
+    $ignoredOnlyRoot = New-TestHotfix 'Ignored zero-byte files' 'select 1 from dual;' $ignoredOnlyFiles
     foreach ($relative in $ignoredZeroPaths) { [IO.File]::WriteAllBytes((Join-Path $ignoredOnlyRoot $relative), [byte[]]@()) }
     $ignoredOnlyAudit = Audit-Path $ignoredOnlyRoot
     Assert-Equal $ignoredOnlyAudit.ExitCode 0 'Empty files with ignored extensions do not create a zero-byte finding'
     Assert-True ((Get-ZeroByteSummary $ignoredOnlyAudit) -match '0KB files were not found\.') 'A complete clean scan explicitly reports that no 0KB files were found'
-    $emptyMasterRoot = New-TestRelease 'Empty master file' 'placeholder' @{}
+    $emptyMasterRoot = New-TestHotfix 'Empty master file' 'placeholder' @{}
     [IO.File]::WriteAllBytes((Join-Path $emptyMasterRoot 'sql\master.sql'), [byte[]]@())
     $emptyMasterAudit = Audit-Path $emptyMasterRoot
     Assert-Equal $emptyMasterAudit.ZeroByteFiles.Count 1 'The selected master is included in the zero-byte scan'
@@ -186,7 +186,7 @@ try {
     Assert-Equal $emptyMasterAudit.ExitCode 1 'An empty master cannot produce a clean completed run'
 
     $docHotfix = 'V12-023-2-02-HF-ALC-02'
-    $docRoot = New-TestRelease $docHotfix '@keep.pdf' @{
+    $docRoot = New-TestHotfix $docHotfix '@keep.pdf' @{
         'documentation\V12-023-2-02-HF-ALC-01.docx' = 'placeholder'
         'documentation\Hotfix Installation Instructions for V12C.docx' = 'Preserve installation instructions.'
         'documentation\sub\keep.docx' = 'Nested document; do not rename.'
@@ -216,16 +216,16 @@ try {
     Assert-True (Test-Path -LiteralPath (Join-Path $docRoot 'documentation\~$Office.docx')) 'Office lock files are not documentation rename candidates'
     Assert-True ([string]::IsNullOrEmpty((Audit-Path $docRoot).DocumentationNote)) 'Already matching documentation is skipped without redundant output'
     Assert-Equal ([IO.File]::GetLastWriteTimeUtc($newDoc).Ticks) $docTime 'An already matching document keeps its modification time'
-    $instructionsOnlyRoot = New-TestRelease 'Instructions-only documentation' 'select 1 from dual;' @{ 'documentation\hotfix installation instructions for v12c.DOCX' = 'Keep these instructions.' }
+    $instructionsOnlyRoot = New-TestHotfix 'Instructions-only documentation' 'select 1 from dual;' @{ 'documentation\hotfix installation instructions for v12c.DOCX' = 'Keep these instructions.' }
     $instructionsOnlyAudit = Audit-Path $instructionsOnlyRoot
     Assert-Equal $instructionsOnlyAudit.ExitCode 0 'Instructions are excluded from rename candidates ignoring case'
     Assert-True ([string]::IsNullOrEmpty($instructionsOnlyAudit.DocumentationNote)) 'An instructions-only folder does not trigger a rename or error'
     $caseDocHotfix = 'V12-023-2-02-HF-ALC-03'
-    $caseDocRoot = New-TestRelease $caseDocHotfix 'select 1 from dual;' @{ ('documentation\' + $caseDocHotfix.ToLowerInvariant() + '.DOCX') = 'Opaque document data.' }
+    $caseDocRoot = New-TestHotfix $caseDocHotfix 'select 1 from dual;' @{ ('documentation\' + $caseDocHotfix.ToLowerInvariant() + '.DOCX') = 'Opaque document data.' }
     Assert-Equal (Audit-Path $caseDocRoot).ExitCode 0 'A case-only documentation rename succeeds on Windows'
     Assert-Equal (Get-ChildItem -LiteralPath (Join-Path $caseDocRoot 'documentation') -File).Name ($caseDocHotfix + '.docx') 'Documentation name and extension use the exact target casing'
     $docConflictHotfix = 'V12-023-2-02-HF-ALC-04'
-    $docConflictRoot = New-TestRelease $docConflictHotfix 'select 1 from dual;' @{
+    $docConflictRoot = New-TestHotfix $docConflictHotfix 'select 1 from dual;' @{
         'documentation\old.docx' = 'Preserve the old document.'
         ('documentation\' + $docConflictHotfix + '.docx') = 'Preserve the target document.'
     }
@@ -235,13 +235,13 @@ try {
     Assert-True ($docConflictAudit.DocumentationNote -match 'Multiple DOCX files') 'The documentation ambiguity is explained in the summary'
     Assert-Equal (@(Get-ChildItem -LiteralPath (Join-Path $docConflictRoot 'documentation') -File | Sort-Object Name | ForEach-Object { $_.Name + (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash }) -join '|') $docConflictBefore 'All conflicting documentation files keep their names and bytes'
     $emptyDocHotfix = 'V12-023-2-02-HF-ALC-05'
-    $emptyDocRoot = New-TestRelease $emptyDocHotfix 'select 1 from dual;' @{ 'documentation\old.docx' = 'placeholder' }
+    $emptyDocRoot = New-TestHotfix $emptyDocHotfix 'select 1 from dual;' @{ 'documentation\old.docx' = 'placeholder' }
     [IO.File]::WriteAllBytes((Join-Path $emptyDocRoot 'documentation\old.docx'), [byte[]]@())
     $emptyDocAudit = Audit-Path $emptyDocRoot
     Assert-Equal $emptyDocAudit.ExitCode 1 'An empty DOCX remains a zero-byte finding after being renamed'
     Assert-Equal $emptyDocAudit.ZeroByteFiles[0].RelativePath ('documentation\' + $emptyDocHotfix + '.docx') 'Zero-byte output uses the final documentation filename'
     $docDirectoryHotfix = 'V12-023-2-02-HF-ALC-06'
-    $docDirectoryRoot = New-TestRelease $docDirectoryHotfix 'select 1 from dual;' @{ 'documentation\old.docx' = 'Preserve this document.' }
+    $docDirectoryRoot = New-TestHotfix $docDirectoryHotfix 'select 1 from dual;' @{ 'documentation\old.docx' = 'Preserve this document.' }
     [void](New-Item -ItemType Directory -Path (Join-Path $docDirectoryRoot ('documentation\' + $docDirectoryHotfix + '.docx')))
     Assert-Equal (Audit-Path $docDirectoryRoot).ExitCode 2 'An existing destination directory cannot be overwritten by a DOCX rename'
     Assert-True (Test-Path -LiteralPath (Join-Path $docDirectoryRoot 'documentation\old.docx') -PathType Leaf) 'A documentation destination conflict preserves the source name'
@@ -250,7 +250,7 @@ try {
     $externalDoc = Join-Path $externalDocs 'old.docx'
     Set-Content -LiteralPath $externalDoc -Value 'Preserve the external document.' -Encoding UTF8
     $externalDocHash = (Get-FileHash -LiteralPath $externalDoc -Algorithm SHA256).Hash
-    $docLinkRoot = New-TestRelease 'V12-023-2-02-HF-ALC-08' 'select 1 from dual;' @{}
+    $docLinkRoot = New-TestHotfix 'V12-023-2-02-HF-ALC-08' 'select 1 from dual;' @{}
     [void](New-Item -ItemType Junction -Path (Join-Path $docLinkRoot 'documentation') -Value $externalDocs)
     $docLinkAudit = Audit-Path $docLinkRoot
     Assert-Equal $docLinkAudit.ExitCode 2 'A documentation junction is reported without following it'
@@ -300,7 +300,7 @@ my $other = "OLD_HOTFIX_NAME_LONGER_THAN_THE_NEW_ONE_1234567890";
         @('UTF16-BE', 1201, $true, "`n"), @('UTF32-LE', 12000, $true, "`n"), @('UTF32-BE', 12001, $true, "`n")
     )) {
         $installerName = 'Installer-' + $encodingCase[0]
-        $installerRoot = New-TestRelease $installerName '@child.sql' @{ 'sql\child.sql' = 'select 1 from dual;' }
+        $installerRoot = New-TestHotfix $installerName '@child.sql' @{ 'sql\child.sql' = 'select 1 from dual;' }
         [void](New-Item -ItemType Directory -Path (Join-Path $installerRoot 'v12hotfixinstall'))
         $installerFile = Join-Path $installerRoot 'v12hotfixinstall\v12hotfixinstall.pl'
         $installerEncoding = [Text.Encoding]::GetEncoding($encodingCase[1])
@@ -340,7 +340,7 @@ use Sys::Hostname;
 use Socket;
 use Fcntl qw(:DEFAULT :flock);
 
-# The hotfix number - Edit this value for each release!
+# The hotfix number - Edit this value for each hotfix!
 # This is also the name of the directory where the hotfix files to be copied are found.
 # default value
 # not needed to declare
@@ -356,14 +356,14 @@ my $hostname = `hostname`;
 die "Installer content must never execute";
 '@
     $userHotfix = 'V12-023-2-02-HF-AMA-21'
-    $userInstallerRoot = New-TestRelease ('installer-user-reproduction\' + $userHotfix) 'select 1 from dual;' @{
+    $userInstallerRoot = New-TestHotfix ('installer-user-reproduction\' + $userHotfix) 'select 1 from dual;' @{
         'v12hotfixinstall\v12hotfixinstall.pl' = ''
     }
     $userInstallerPath = Join-Path $userInstallerRoot 'v12hotfixinstall\v12hotfixinstall.pl'
     [IO.File]::WriteAllText($userInstallerPath, $userInstallerText, [Text.UTF8Encoding]::new($false))
     $userMasterPath = Join-Path $userInstallerRoot 'sql\master.sql'
     $userMasterHash = (Get-FileHash -LiteralPath $userMasterPath).Hash
-    $userInstallerRun = Run-Cli @('-ReleasePath', $userInstallerRoot, '-MasterPath', 'sql\master.sql') 'installer-fcntl-import' $true
+    $userInstallerRun = Run-Cli @('-HotfixPath', $userInstallerRoot, '-MasterPath', 'sql\master.sql') 'installer-fcntl-import' $true
     Assert-Equal $userInstallerRun.ExitCode 0 'The real CMD launcher accepts the supplied installer header with its Fcntl qw import'
     $expectedUserInstaller = $userInstallerText.Replace('my $hotfix = "V12-023-2-02-HF-AMA-01";', ('my $hotfix = "' + $userHotfix + '";'))
     Assert-Equal ([Convert]::ToBase64String([IO.File]::ReadAllBytes($userInstallerPath))) ([Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($expectedUserInstaller))) 'The supplied header changes only the hotfix value, leaving imports, patch settings and installer body byte-identical'
@@ -371,10 +371,10 @@ die "Installer content must never execute";
     $userInstallerSummary = Get-Content -Raw -LiteralPath $userInstallerRun.SummaryPath
     Assert-True ($userInstallerSummary.Contains('Installer updated:') -and -not $userInstallerSummary.Contains('Installer update failed:')) 'The supplied header produces a successful installer result in the summary'
     Assert-True ((Get-Content -Raw -LiteralPath $userInstallerRun.Log).Contains($userInstallerSummary.TrimEnd())) 'CMD and saved TXT agree on the corrected installer result'
-    Assert-Equal (@(Get-ChildItem -LiteralPath (Split-Path -Parent $userInstallerPath) -Force -Filter '.release-checker-*').Count) 0 'The corrected installer update cleans its staging and backup files'
+    Assert-Equal (@(Get-ChildItem -LiteralPath (Split-Path -Parent $userInstallerPath) -Force -Filter '.hotfix-checker-*').Count) 0 'The corrected installer update cleans its staging and backup files'
     $userInstallerHash = (Get-FileHash -LiteralPath $userInstallerPath).Hash
     $userInstallerTime = [IO.File]::GetLastWriteTimeUtc($userInstallerPath)
-    $userInstallerRerun = Run-Cli @('-ReleasePath', $userInstallerRoot, '-MasterPath', 'sql\master.sql') 'installer-fcntl-import-rerun' $true
+    $userInstallerRerun = Run-Cli @('-HotfixPath', $userInstallerRoot, '-MasterPath', 'sql\master.sql') 'installer-fcntl-import-rerun' $true
     Assert-Equal $userInstallerRerun.ExitCode 0 'The supplied header succeeds again after its hotfix value already matches'
     Assert-Equal (Get-FileHash -LiteralPath $userInstallerPath).Hash $userInstallerHash 'A rerun of the supplied header preserves installer bytes'
     Assert-Equal ([IO.File]::GetLastWriteTimeUtc($userInstallerPath).Ticks) $userInstallerTime.Ticks 'A rerun of the supplied header preserves the installer timestamp'
@@ -385,7 +385,7 @@ die "Installer content must never execute";
         @('Empty', 'use File::Copy qw();'),
         @('Symbols', 'use Some::Module_2 qw(:tag CONSTANT_1 symbol2);')
     )) {
-        $importRoot = New-TestRelease ('Installer-import-' + $importCase[0]) 'select 1 from dual;' @{
+        $importRoot = New-TestHotfix ('Installer-import-' + $importCase[0]) 'select 1 from dual;' @{
             'v12hotfixinstall\v12hotfixinstall.pl' = ($importCase[1] + "`n" + 'my $hotfix = "OLD";')
         }
         $importPath = Join-Path $importRoot 'v12hotfixinstall\v12hotfixinstall.pl'
@@ -413,7 +413,7 @@ die "Installer content must never execute";
         @('Regex-literal', "my `$example = /`nmy `$hotfix = `"EXAMPLE`";`n/;`n"),
         @('Format', "format STDOUT =`nmy `$hotfix = `"EXAMPLE`";`n.`n")
     )) {
-        $badInstallerRoot = New-TestRelease ('Installer-' + $badInstaller[0]) 'select 1 from dual;' @{ 'v12hotfixinstall\v12hotfixinstall.pl' = $badInstaller[1] }
+        $badInstallerRoot = New-TestHotfix ('Installer-' + $badInstaller[0]) 'select 1 from dual;' @{ 'v12hotfixinstall\v12hotfixinstall.pl' = $badInstaller[1] }
         $badInstallerPath = Join-Path $badInstallerRoot 'v12hotfixinstall\v12hotfixinstall.pl'
         $badInstallerHash = (Get-FileHash -LiteralPath $badInstallerPath -Algorithm SHA256).Hash
         $badInstallerAudit = Audit-Path $badInstallerRoot
@@ -433,7 +433,7 @@ die "Installer content must never execute";
     )) {
         $contextName = 'Installer-context-' + $context[0]
         $contextText = $context[1] + 'my $hotfix = "OLD";' + $context[2]
-        $contextRoot = New-TestRelease $contextName 'select 1 from dual;' @{ 'v12hotfixinstall\v12hotfixinstall.pl' = $contextText }
+        $contextRoot = New-TestHotfix $contextName 'select 1 from dual;' @{ 'v12hotfixinstall\v12hotfixinstall.pl' = $contextText }
         $contextFile = Join-Path $contextRoot 'v12hotfixinstall\v12hotfixinstall.pl'
         $contextOriginal = [IO.File]::ReadAllText($contextFile)
         $contextAudit = Audit-Path $contextRoot
@@ -441,7 +441,7 @@ die "Installer content must never execute";
         Assert-Equal ([IO.File]::ReadAllText($contextFile)) ($contextOriginal.Replace('my $hotfix = "OLD";', ('my $hotfix = "' + $contextName + '";'))) 'Embedded examples and all surrounding text retain their exact contents'
         Assert-Equal (Audit-Path $contextRoot).InstallerStatus 'AlreadyMatches' 'Context-aware installer editing remains idempotent'
     }
-    $quotedRoot = New-TestRelease 'Installer-quote''s-$x-@y' 'select 1 from dual;' @{ 'v12hotfixinstall\v12hotfixinstall.pl' = 'my $hotfix = ''OLD\''QUOTE'';' }
+    $quotedRoot = New-TestHotfix 'Installer-quote''s-$x-@y' 'select 1 from dual;' @{ 'v12hotfixinstall\v12hotfixinstall.pl' = 'my $hotfix = ''OLD\''QUOTE'';' }
     $quotedFile = Join-Path $quotedRoot 'v12hotfixinstall\v12hotfixinstall.pl'
     Assert-Equal (Audit-Path $quotedRoot).InstallerStatus 'Updated' 'Escaped quotes in a single-quoted installer value are recognized'
     Assert-Equal ([IO.File]::ReadAllText($quotedFile).Trim()) 'my $hotfix = ''Installer-quote\''s-$x-@y'';' 'The replacement preserves literal Perl metacharacters and escapes the delimiter'
@@ -452,7 +452,7 @@ die "Installer content must never execute";
     Assert-Equal (Audit-Path $quotedRoot).InstallerStatus 'AlreadyMatches' 'Escaped double-quoted values remain idempotent'
 
     $storedName = 'V12-023-2-02-HF-MiXeD-21'
-    $storedRoot = New-TestRelease $storedName 'select 1 from dual;' @{
+    $storedRoot = New-TestHotfix $storedName 'select 1 from dual;' @{
         'v12hotfixinstall\v12hotfixinstall.pl' = 'my $hotfix = "OLD";'
         'sql\V12-old.last.perl' = 'hook bytes'
         'documentation\V12-old.docx' = 'document bytes'
@@ -465,7 +465,7 @@ die "Installer content must never execute";
     Assert-Equal (@(Get-ChildItem -LiteralPath (Join-Path $storedRoot 'sql') -Filter '*.perl')[0].Name) ($storedName + '.last.perl') 'Hook rename uses the stored folder spelling'
     Assert-Equal (@(Get-ChildItem -LiteralPath (Join-Path $storedRoot 'documentation') -Filter '*.docx')[0].Name) ($storedName + '.docx') 'Documentation rename uses the stored folder spelling'
 
-    $lockedRoot = New-TestRelease 'Installer-locked' 'select 1 from dual;' @{ 'v12hotfixinstall\v12hotfixinstall.pl' = 'my $hotfix = "OLD";' }
+    $lockedRoot = New-TestHotfix 'Installer-locked' 'select 1 from dual;' @{ 'v12hotfixinstall\v12hotfixinstall.pl' = 'my $hotfix = "OLD";' }
     $lockedFile = Join-Path $lockedRoot 'v12hotfixinstall\v12hotfixinstall.pl'
     $lockedHash = (Get-FileHash -LiteralPath $lockedFile).Hash
     $lockStream = [IO.File]::Open($lockedFile, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
@@ -474,12 +474,12 @@ die "Installer content must never execute";
         Assert-Equal $lockedAudit.InstallerStatus 'Failed' 'A sharing conflict prevents replacing the installer'
         Assert-Equal $lockedAudit.ExitCode 2 'A blocked installer replacement is reported as incomplete'
         Assert-Equal (Get-FileHash -LiteralPath $lockedFile).Hash $lockedHash 'A failed replacement preserves the complete original installer'
-        Assert-Equal (@(Get-ChildItem -LiteralPath (Split-Path -Parent $lockedFile) -Force -Filter '.release-checker-*').Count) 0 'Failed replacement removes the staged file'
+        Assert-Equal (@(Get-ChildItem -LiteralPath (Split-Path -Parent $lockedFile) -Force -Filter '.hotfix-checker-*').Count) 0 'Failed replacement removes the staged file'
     } finally { $lockStream.Dispose() }
     Assert-Equal (Audit-Path $lockedRoot).InstallerStatus 'Updated' 'An installer can be retried after the competing file handle closes'
-    Assert-Equal (@(Get-ChildItem -LiteralPath (Split-Path -Parent $lockedFile) -Force -Filter '.release-checker-*').Count) 0 'Successful replacement leaves no staged files'
+    Assert-Equal (@(Get-ChildItem -LiteralPath (Split-Path -Parent $lockedFile) -Force -Filter '.hotfix-checker-*').Count) 0 'Successful replacement leaves no staged files'
 
-    $recoveryRoot = New-TestRelease 'Installer-recovery' 'select 1 from dual;' @{ 'v12hotfixinstall\v12hotfixinstall.pl' = 'my $hotfix = "OLD";' }
+    $recoveryRoot = New-TestHotfix 'Installer-recovery' 'select 1 from dual;' @{ 'v12hotfixinstall\v12hotfixinstall.pl' = 'my $hotfix = "OLD";' }
     $recoveryFile = Join-Path $recoveryRoot 'v12hotfixinstall\v12hotfixinstall.pl'
     $recoveryHash = (Get-FileHash -LiteralPath $recoveryFile).Hash
     $replaceImplementation = ${function:Complete-InstallerReplacement}
@@ -495,8 +495,8 @@ die "Installer content must never execute";
         Assert-Equal $recoveryAudit.ExitCode 2 'A partial replacement cannot be reported as a successful audit'
         Assert-True (-not (Test-Path -LiteralPath $recoveryFile)) 'The failure simulation reached the missing-original-path state'
         $recoveryFolder = Split-Path -Parent $recoveryFile
-        $savedOriginal = @(Get-ChildItem -LiteralPath $recoveryFolder -Force -Filter '.release-checker-*.bak')
-        $savedReplacement = @(Get-ChildItem -LiteralPath $recoveryFolder -Force -Filter '.release-checker-*.tmp')
+        $savedOriginal = @(Get-ChildItem -LiteralPath $recoveryFolder -Force -Filter '.hotfix-checker-*.bak')
+        $savedReplacement = @(Get-ChildItem -LiteralPath $recoveryFolder -Force -Filter '.hotfix-checker-*.tmp')
         Assert-Equal $savedOriginal.Count 1 'A partial replacement retains the original backup'
         Assert-Equal $savedReplacement.Count 1 'A partial replacement retains the prepared replacement'
         Assert-Equal (Get-FileHash -LiteralPath $savedOriginal[0].FullName).Hash $recoveryHash 'Recovery preserves every byte of the original installer'
@@ -509,7 +509,7 @@ die "Installer content must never execute";
         [IO.File]::SetAttributes($installerFile, ($matchingAttributes -bor [IO.FileAttributes]::ReadOnly))
         Assert-Equal (Audit-Path $installerRoot).InstallerStatus 'AlreadyMatches' 'An already matching read-only installer does not need write access'
     } finally { [IO.File]::SetAttributes($installerFile, $matchingAttributes) }
-    $readOnlyRoot = New-TestRelease 'Installer-readonly-mismatch' 'select 1 from dual;' @{ 'v12hotfixinstall\v12hotfixinstall.pl' = 'my $hotfix = "OLD";' }
+    $readOnlyRoot = New-TestHotfix 'Installer-readonly-mismatch' 'select 1 from dual;' @{ 'v12hotfixinstall\v12hotfixinstall.pl' = 'my $hotfix = "OLD";' }
     $readOnlyFile = Join-Path $readOnlyRoot 'v12hotfixinstall\v12hotfixinstall.pl'
     $readOnlyHash = (Get-FileHash -LiteralPath $readOnlyFile -Algorithm SHA256).Hash
     $readOnlyAttributes = [IO.File]::GetAttributes($readOnlyFile)
@@ -525,11 +525,11 @@ die "Installer content must never execute";
     $linkedInstaller = Join-Path $installerLinkTarget 'v12hotfixinstall.pl'
     Set-Content -LiteralPath $linkedInstaller -Value 'my $hotfix = "OLD";' -Encoding UTF8
     $linkedInstallerHash = (Get-FileHash -LiteralPath $linkedInstaller -Algorithm SHA256).Hash
-    $installerLinkRoot = New-TestRelease 'Installer-junction' 'select 1 from dual;' @{}
+    $installerLinkRoot = New-TestHotfix 'Installer-junction' 'select 1 from dual;' @{}
     [void](New-Item -ItemType Junction -Path (Join-Path $installerLinkRoot 'v12hotfixinstall') -Value $installerLinkTarget)
     Assert-Equal (Audit-Path $installerLinkRoot).InstallerStatus 'Failed' 'The updater rejects a junction in the installer path'
     Assert-Equal (Get-FileHash -LiteralPath $linkedInstaller -Algorithm SHA256).Hash $linkedInstallerHash 'A linked installer outside the hotfix is never edited'
-    $installerHardlinkRoot = New-TestRelease 'Installer-hardlink' 'select 1 from dual;' @{}
+    $installerHardlinkRoot = New-TestHotfix 'Installer-hardlink' 'select 1 from dual;' @{}
     [void](New-Item -ItemType Directory -Path (Join-Path $installerHardlinkRoot 'v12hotfixinstall'))
     [void](New-Item -ItemType HardLink -Path (Join-Path $installerHardlinkRoot 'v12hotfixinstall\v12hotfixinstall.pl') -Value $linkedInstaller)
     Assert-Equal (Audit-Path $installerHardlinkRoot).InstallerStatus 'Failed' 'The updater refuses to write through an installer hardlink'
@@ -546,11 +546,11 @@ die "Installer content must never execute";
         ('sql\' + $oldHookPrefix + '.first.perl') = '# Different suffix.'
         ('sql\sub\' + $oldHookPrefix + '.aftercopy.perl') = '# Nested file; keep its name.'
         'sql\generic.aftercopy.perl' = '# Not a V12 hotfix prefix.'
-        'sql\v11-old.aftercopy.perl' = '# Different release prefix.'
+        'sql\v11-old.aftercopy.perl' = '# Different hotfix prefix.'
     }
     foreach ($suffix in $hookSuffixes) { $hookFiles['sql\' + $oldHookPrefix + '.' + $suffix] = '# Opaque hook data for ' + $suffix }
     $hookMaster = "@payload.pb`n@" + $oldHookPrefix + ".aftercopy.perl.bak`n" + (($hookSuffixes | ForEach-Object { 'START ' + $renameHotfix + '.' + $_ }) -join "`n")
-    $renameRoot = New-TestRelease $renameHotfix $hookMaster $hookFiles
+    $renameRoot = New-TestHotfix $renameHotfix $hookMaster $hookFiles
     $hookHashes = @{}; $hookTimes = @{}
     foreach ($suffix in $hookSuffixes) {
         $sourceHook = Join-Path $renameRoot ('sql\' + $oldHookPrefix + '.' + $suffix)
@@ -581,7 +581,7 @@ die "Installer content must never execute";
     $caseHotfix = 'V12-023-2-02-HF-AMA-22'
     $caseFiles = @{}
     foreach ($suffix in $hookSuffixes) { $caseFiles['sql\' + $caseHotfix.ToLowerInvariant() + '.' + $suffix.ToUpperInvariant()] = '# Case-only rename.' }
-    $caseRoot = New-TestRelease $caseHotfix 'select 1 from dual;' $caseFiles
+    $caseRoot = New-TestHotfix $caseHotfix 'select 1 from dual;' $caseFiles
     $caseAudit = Audit-Path $caseRoot
     Assert-Equal $caseAudit.ExitCode 0 'Case-only renames work in Windows PowerShell 5.1'
     foreach ($suffix in $hookSuffixes) {
@@ -591,7 +591,7 @@ die "Installer content must never execute";
     Assert-Equal (Audit-Path $caseRoot).ScriptRenameNotes.Count 0 'Case-normalized hooks need no second rename'
 
     $conflictHotfix = 'V12-023-2-02-HF-AMA-23'
-    $conflictRoot = New-TestRelease $conflictHotfix 'select 1 from dual;' @{
+    $conflictRoot = New-TestHotfix $conflictHotfix 'select 1 from dual;' @{
         ('sql\' + $oldHookPrefix + '.aftercopy.perl') = '# Keep the old file.'
         ('sql\' + $conflictHotfix + '.aftercopy.perl') = '# Keep the existing target.'
         ('sql\' + $oldHookPrefix + '.beforecopy.perl') = '# This unambiguous suffix can still be renamed.'
@@ -604,7 +604,7 @@ die "Installer content must never execute";
     Assert-True ((Get-CoverageSummary $conflictAudit) -match 'Script rename failed.*Multiple matching files') 'The summary explains a rename conflict'
     Assert-True (Test-Path -LiteralPath (Join-Path $conflictRoot ('sql\' + $conflictHotfix + '.beforecopy.perl'))) 'An unrelated unambiguous suffix is still renamed'
     $directoryHotfix = 'V12-023-2-02-HF-AMA-24'
-    $directoryRoot = New-TestRelease $directoryHotfix 'select 1 from dual;' @{ ('sql\' + $oldHookPrefix + '.undeploy') = '# Keep this file.' }
+    $directoryRoot = New-TestHotfix $directoryHotfix 'select 1 from dual;' @{ ('sql\' + $oldHookPrefix + '.undeploy') = '# Keep this file.' }
     [void](New-Item -ItemType Directory -Path (Join-Path $directoryRoot ('sql\' + $directoryHotfix + '.undeploy')))
     Assert-Equal (Audit-Path $directoryRoot).ExitCode 2 'An existing destination directory cannot be overwritten by a hook file'
     Assert-True (Test-Path -LiteralPath (Join-Path $directoryRoot ('sql\' + $oldHookPrefix + '.undeploy')) -PathType Leaf) 'A destination directory conflict preserves the source name'
@@ -625,9 +625,9 @@ die "Installer content must never execute";
     Assert-True (Test-Path -LiteralPath $externalHook -PathType Leaf) 'A sql junction cannot rename a hook outside the selected hotfix'
     Assert-Equal (Get-FileHash -LiteralPath $externalHook -Algorithm SHA256).Hash $externalHookHash 'A sql junction cannot change external hook bytes'
 
-    $expected = @(Import-Csv -LiteralPath (Join-Path $testRoot 'expected-release-one.csv'))
+    $expected = @(Import-Csv -LiteralPath (Join-Path $testRoot 'expected-hotfix-one.csv'))
     foreach ($nested in @($false, $true)) {
-        $audit = Audit-Fixture 'Release one' $nested
+        $audit = Audit-Fixture 'Hotfix one' $nested
         Assert-Equal $audit.Files.Count 36 'All files inventoried'
         Assert-Equal @($audit.Files | Where-Object { $_.Excluded }).Count 8 'Configured excluded extensions, mixed case'
         Assert-Equal $audit.Rows.Count 27 'Master excluded, every other eligible file retained'
@@ -643,15 +643,15 @@ die "Installer content must never execute";
             Assert-Equal $row.MatchingMethod $method "Matching method: $($e.RelativeFilePath)"
             Assert-Equal $row.AuditStatus 'Incomplete' 'CSV rows signal provisional coverage'
         }
-        Assert-Equal @($audit.References | Where-Object { $_.Status -eq 'Ambiguous' }).Count 0 'Direct bare filenames cover exact copies across release folders'
-        Assert-Equal @($audit.References | Where-Object { $_.Status -eq 'MissingInRelease' }).Count 2 'Wrong explicit path and missing call both reported'
-        Assert-Equal @($audit.References | Where-Object { $_.Target -eq 'wrong\py_post.pb' -and $_.Status -eq 'MissingInRelease' }).Count 1 'Wrong path cannot use basename fallback'
+        Assert-Equal @($audit.References | Where-Object { $_.Status -eq 'Ambiguous' }).Count 0 'Direct bare filenames cover exact copies across hotfix folders'
+        Assert-Equal @($audit.References | Where-Object { $_.Status -eq 'MissingInHotfix' }).Count 2 'Wrong explicit path and missing call both reported'
+        Assert-Equal @($audit.References | Where-Object { $_.Target -eq 'wrong\py_post.pb' -and $_.Status -eq 'MissingInHotfix' }).Count 1 'Wrong path cannot use basename fallback'
         Assert-Equal @($audit.References | Where-Object { $_.LineNumber -eq 18 -and $_.Target -eq 'py_post.pb' }).Count 1 'Original source line retained'
         $quoted = @($audit.References | Where-Object { $_.Target -eq 'subfolder\script with spaces.pb' })[0]
         Assert-Equal $quoted.Arguments 'argument1 "argument two"' 'Arguments are separate from quoted target'
         Assert-True ((Row $audit 'docs\unique.DATA').Notes -match 'runtime SQL\*Plus lookup is not established') 'Unique filename caveat appears in CSV'
         Assert-Equal @($audit.References | Where-Object { $_.Cycle }).Count $(if ($nested) { 1 } else { 0 }) 'Cycle detection stops recursion'
-        Assert-Equal $audit.Repeated.Count $(if ($nested) { 4 } else { 3 }) 'Repeated static calls grouped per matching release file'
+        Assert-Equal $audit.Repeated.Count $(if ($nested) { 4 } else { 3 }) 'Repeated static calls grouped per matching hotfix file'
         Assert-Equal @($audit.References | Where-Object { $_.SourceFile -like '*unrelated.sql' }).Count 0 'Unrelated scripts never contribute coverage'
         if ($nested) {
             $indirect = Row $audit 'sql\subfolder\indirect.sql'
@@ -661,14 +661,14 @@ die "Installer content must never execute";
     }
     Assert-Equal (Audit-Fixture 'Clean').ExitCode 0 'Clean fixture exit zero'
     Assert-Equal (Audit-Fixture 'Clean' $true).ExitCode 0 'Clean nested audit exit zero'
-    $second = Audit-Fixture 'Release two'
+    $second = Audit-Fixture 'Hotfix two'
     Assert-Equal $second.ExitCode 1 'Completed fixture with findings exit one'
-    Assert-Equal $second.References[0].Status 'MissingInRelease' 'Another release cannot satisfy a missing call'
+    Assert-Equal $second.References[0].Status 'MissingInHotfix' 'Another hotfix cannot satisfy a missing call'
 
     Write-Host 'Checking master calls against the hotfix inventory and allowed missing targets.'
     Assert-Equal $script:AllowedMissingCallTargets.Count 93 'All supplied exception entries are included'
     $allowedMaster = ($script:AllowedMissingCallTargets | ForEach-Object { 'START ' + $_.ToUpperInvariant() }) -join "`n"
-    $allowedRoot = New-TestRelease 'Allowed missing targets' $allowedMaster @{}
+    $allowedRoot = New-TestHotfix 'Allowed missing targets' $allowedMaster @{}
     $allowedAudit = Audit-Path $allowedRoot
     Assert-Equal $allowedAudit.ExitCode 0 'A hotfix containing only allowed missing calls has no findings'
     Assert-Equal $allowedAudit.Counts['Allowed missing calls ignored'] 93 'Every supplied exception is recognized ignoring case'
@@ -678,7 +678,7 @@ die "Installer content must never execute";
     Assert-True ((Get-CoverageSummary $allowedAudit) -match 'File presence result: YES') 'Allowed missing calls permit a successful presence result'
     Assert-True ((Get-CoverageSummary $allowedAudit) -notmatch 'Ignored missing calls \(allowed list\)|dbdefine\.sql|ptfcompx|invalidobjects\.sql') 'Allowed missing calls stay out of the normal summary filename output'
 
-    $presenceRoot = New-TestRelease 'Master file presence' @'
+    $presenceRoot = New-TestHotfix 'Master file presence' @'
 -- start commented_missing.sql
 PROMPT start output_missing.sql
 select 'start literal_missing.sql' from dual;
@@ -709,32 +709,32 @@ start support.txt
     Assert-True ($presenceSummary -match '(?s)Files with no matching call in the master.*Master call file check') 'Presence section follows the existing coverage section'
     Assert-True ($presenceSummary -match 'missing_required.pb \(line 11\)' -and $presenceSummary -match 'wrong\\payload.pb \(line 12\)') 'Missing files include their exact master line numbers'
 
-    $allowedPresentRoot = New-TestRelease 'Allowed target supplied' '@DBDEFINE.SQL' @{ 'docs\dbdefine.sql' = 'select 1 from dual;' }
+    $allowedPresentRoot = New-TestHotfix 'Allowed target supplied' '@DBDEFINE.SQL' @{ 'docs\dbdefine.sql' = 'select 1 from dual;' }
     $allowedPresent = Audit-Path $allowedPresentRoot
     Assert-Equal $allowedPresent.Counts['Calls with files present'] 1 'An allowed target actually supplied is counted as present'
     Assert-Equal $allowedPresent.Counts['Allowed missing calls ignored'] 0 'Present exception files are not classified as missing'
     Assert-Equal (Row $allowedPresent 'docs\dbdefine.sql').DirectCallCount 1 'Supplied exception files retain normal call coverage'
-    $allowedUncalledRoot = New-TestRelease 'Allowed target uncalled' 'select 1 from dual;' @{ 'sql\dbdefine.sql' = 'select 2 from dual;' }
+    $allowedUncalledRoot = New-TestHotfix 'Allowed target uncalled' 'select 1 from dual;' @{ 'sql\dbdefine.sql' = 'select 2 from dual;' }
     Assert-Equal (Audit-Path $allowedUncalledRoot).Counts['Files not directly referenced'] 1 'The missing-call exception list never exempts an uncalled file'
-    $allowedLookalikeRoot = New-TestRelease 'Allowed target lookalikes' "@old_dbdefine.sql`n@dbdefine.sql.bak`n@dbdefine.ps" @{}
+    $allowedLookalikeRoot = New-TestHotfix 'Allowed target lookalikes' "@old_dbdefine.sql`n@dbdefine.sql.bak`n@dbdefine.ps" @{}
     Assert-Equal (Audit-Path $allowedLookalikeRoot).Counts['Required calls missing files'] 3 'Only whole filenames with the exact extension qualify for an exception'
-    $allowedDynamicRoot = New-TestRelease 'Allowed target dynamic' "@&dir/dbdefine.sql`nSET SUFFIX pb`n@ptfcompx" @{}
+    $allowedDynamicRoot = New-TestHotfix 'Allowed target dynamic' "@&dir/dbdefine.sql`nSET SUFFIX pb`n@ptfcompx" @{}
     $allowedDynamic = Audit-Path $allowedDynamicRoot
     Assert-Equal $allowedDynamic.Counts['Allowed missing calls ignored'] 0 'Variables and unknown suffixes cannot acquire an exception'
     Assert-Equal $allowedDynamic.Counts['Master calls requiring review'] 2 'Uncertain targets remain visible for review'
     Assert-True ((Get-MasterCallSummary $allowedDynamic) -match 'File presence result: INCOMPLETE') 'Uncertain targets cannot produce a successful presence result'
-    $allowedUrlRoot = New-TestRelease 'Allowed filename in URL' '@https://example.invalid/dbdefine.sql' @{}
+    $allowedUrlRoot = New-TestHotfix 'Allowed filename in URL' '@https://example.invalid/dbdefine.sql' @{}
     Assert-Equal (Audit-Path $allowedUrlRoot).Counts['Required calls missing files'] 1 'External URLs cannot acquire a filesystem filename exception'
-    $ambiguousPresenceRoot = New-TestRelease 'Ambiguous master target' '@@duplicate.sql' @{
+    $ambiguousPresenceRoot = New-TestHotfix 'Ambiguous master target' '@@duplicate.sql' @{
         'one\duplicate.sql' = 'select 1 from dual;'; 'two\duplicate.sql' = 'select 2 from dual;'
     }
     $ambiguousPresence = Audit-Path $ambiguousPresenceRoot
     Assert-Equal $ambiguousPresence.Counts['Master calls requiring review'] 1 'An ambiguous caller-relative target remains visible for review'
     Assert-Equal $ambiguousPresence.ExitCode 2 'A presence review cannot produce a completed audit exit code'
-    $allowedNestedRoot = New-TestRelease 'Nested target scope' '@child.sql' @{ 'sql\child.sql' = '@dbdefine.sql' }
+    $allowedNestedRoot = New-TestHotfix 'Nested target scope' '@child.sql' @{ 'sql\child.sql' = '@dbdefine.sql' }
     $allowedNested = Audit-Path $allowedNestedRoot $true
     Assert-Equal $allowedNested.MasterCalls.Count 1 'The new check covers calls in the selected master only'
-    Assert-Equal @($allowedNested.References | Where-Object { -not $_.Direct -and $_.Status -eq 'MissingInRelease' }).Count 1 'Master exceptions do not conceal missing nested calls in detailed reports'
+    Assert-Equal @($allowedNested.References | Where-Object { -not $_.Direct -and $_.Status -eq 'MissingInHotfix' }).Count 1 'Master exceptions do not conceal missing nested calls in detailed reports'
 
     $settingsDirect = Audit-Fixture 'Settings'
     Assert-Equal (Row $settingsDirect 'sql\default_name.sql').DirectReferenceStatus 'DirectlyReferenced' 'Direct mode uses declared default assumptions only'
@@ -744,7 +744,7 @@ start support.txt
     Assert-Equal (Row $settingsNested 'sql\default_name.pb').DirectReferenceStatus 'NoDirectReferenceFound' 'No alternate extension guessed'
     Assert-True (@($settingsNested.References | Where-Object { $_.Status -eq 'Unresolved' -and $_.Target -eq 'default_name' }).Count -eq 1) 'Extensionless target is manual review'
 
-    $context = New-TestRelease 'Context' '@@sub\driver.sql' @{
+    $context = New-TestHotfix 'Context' '@@sub\driver.sql' @{
         'sql\sub\driver.sql' = "@@leaf.sql`n@leaf.sql`nSTART leaf.sql"
         'sql\sub\leaf.sql' = 'select 1 from dual;'
         'working\leaf.sql' = 'select 2 from dual;'
@@ -754,7 +754,7 @@ start support.txt
     Assert-Equal (Row $contextAudit 'working\leaf.sql').IndirectCallCount 2 'START/@ retain override working directory in nested scripts'
     Assert-Equal @($contextAudit.References | Where-Object { $_.Status -eq 'Ambiguous' }).Count 0 'Path context disambiguates duplicate basenames'
 
-    $absolute = New-TestRelease 'Absolute' '-- placeholder' @{ 'payload.bintext' = 'select 1 from dual;' }
+    $absolute = New-TestHotfix 'Absolute' '-- placeholder' @{ 'payload.bintext' = 'select 1 from dual;' }
     $outside = Join-Path $work 'Outside\external.sql'
     Set-Content -LiteralPath (Join-Path $absolute 'sql\master.sql') -Encoding UTF8 -Value @(
         ('start "' + (Join-Path $absolute 'sql\..\payload.bintext') + '"'),
@@ -763,11 +763,11 @@ start support.txt
     )
     $absoluteAudit = Audit-Path $absolute
     Assert-Equal (Row $absoluteAudit 'payload.bintext').MatchingMethod 'AbsolutePath' 'Normalized absolute path resolves'
-    Assert-Equal @($absoluteAudit.References | Where-Object { $_.Status -eq 'OutsideRelease' }).Count 3 'Absolute external, UNC, URL separated without probing'
+    Assert-Equal @($absoluteAudit.References | Where-Object { $_.Status -eq 'OutsideHotfix' }).Count 3 'Absolute external, UNC, URL separated without probing'
     Assert-Equal $absoluteAudit.ExitCode 1 'External reference findings do not claim machine-wide absence'
     Assert-True (-not (Test-InRoot ($absolute + 'Sibling\file.sql') $absolute)) 'Root boundary does not accept a prefix sibling'
 
-    $manual = New-TestRelease 'Manual' "host echo unsupported`n! echo unsupported`n:r child.sql`n@&name`nstart -`nchild.sql`nSTART`n@'unterminated`n@child.sql" @{ 'sql\child.sql' = 'select 1 from dual;' }
+    $manual = New-TestHotfix 'Manual' "host echo unsupported`n! echo unsupported`n:r child.sql`n@&name`nstart -`nchild.sql`nSTART`n@'unterminated`n@child.sql" @{ 'sql\child.sql' = 'select 1 from dual;' }
     $manualAudit = Audit-Path $manual
     Assert-Equal @($manualAudit.References | Where-Object { $_.Status -eq 'Unsupported' }).Count 3 'HOST, !, and SQLCMD :r require review'
     Assert-Equal @($manualAudit.References | Where-Object { $_.Status -eq 'Unresolved' }).Count 4 'Variable, continuation, missing operand, unclosed target require review'
@@ -780,18 +780,18 @@ start support.txt
     Assert-True ($manualSummary -match '4 script call\(s\) could not be resolved.*-DetailedReport') 'Actual unresolved script calls retain a concise actionable note'
     $manualDetails = Get-Summary $manualAudit
     Assert-True ($manualDetails -match 'Unresolved / manual review:' -and $manualDetails -match 'host echo unsupported' -and $manualDetails -match 'Empty, dynamic, variable-bearing') 'Detailed reports retain actual source lines and reasons for unresolved and unsupported commands'
-    $concat = New-TestRelease 'Concatenation' "start 'child' || '.sql'" @{ 'sql\child.sql' = 'select 1 from dual;' }
+    $concat = New-TestHotfix 'Concatenation' "start 'child' || '.sql'" @{ 'sql\child.sql' = 'select 1 from dual;' }
     Assert-Equal (Audit-Path $concat).References[0].Status 'Unresolved' 'Possible filename concatenation requires review'
-    $sqlClause = New-TestRelease 'SqlClause' "select id from tree`nSTART WITH id=1`nconnect by prior id=parent_id;" @{ 'sql\with.sql' = 'select 1 from dual;' }
+    $sqlClause = New-TestHotfix 'SqlClause' "select id from tree`nSTART WITH id=1`nconnect by prior id=parent_id;" @{ 'sql\with.sql' = 'select 1 from dual;' }
     Assert-Equal (Row (Audit-Path $sqlClause) 'sql\with.sql').DirectCallCount 0 'SQL START WITH clause cannot call a file named with.sql'
     Assert-Equal (Audit-Path $sqlClause).ExitCode 2 'START WITH clause or unquoted WITH target requires review'
-    $extensionless = New-TestRelease 'Extensionless' '@payload' @{ 'sql\payload.pb' = 'select 1 from dual;'; 'sql\payload.ps' = 'select 1 from dual;' }
+    $extensionless = New-TestHotfix 'Extensionless' '@payload' @{ 'sql\payload.pb' = 'select 1 from dual;'; 'sql\payload.ps' = 'select 1 from dual;' }
     $extensionlessAudit = Audit-Path $extensionless
-    Assert-Equal $extensionlessAudit.References[0].Status 'MissingInRelease' 'Extensionless target never guesses .pb or .ps'
+    Assert-Equal $extensionlessAudit.References[0].Status 'MissingInHotfix' 'Extensionless target never guesses .pb or .ps'
     Assert-True ($extensionlessAudit.References[0].ResolvedPath.EndsWith('payload.sql')) 'Missing extensionless target records assumed .sql path'
-    $freeText = New-TestRelease 'FreeText' "REM q'[`nPROMPT 'never closed`nSPOOL Bob's.log`n@child.sql" @{ 'sql\child.sql' = 'select 1 from dual;' }
+    $freeText = New-TestHotfix 'FreeText' "REM q'[`nPROMPT 'never closed`nSPOOL Bob's.log`n@child.sql" @{ 'sql\child.sql' = 'select 1 from dual;' }
     Assert-Equal (Audit-Path $freeText).ExitCode 0 'Free-text comments/logging quotes do not hide calls'
-    $controlText = New-TestRelease 'Control text' "@first.sql`nPAUSE Don't continue before checking the backup`nSET SQLPROMPT Developer's DB>`nCONNECT user/secret'@database`nSTART second.pb`nselect 'multiline SQL:`nSTART decoy.pb`n' from dual;`nselect q'[alternate SQL:`n@decoy.pb`n]' from dual;`n-- START decoy.pb`n/* START decoy.pb */" @{
+    $controlText = New-TestHotfix 'Control text' "@first.sql`nPAUSE Don't continue before checking the backup`nSET SQLPROMPT Developer's DB>`nCONNECT user/secret'@database`nSTART second.pb`nselect 'multiline SQL:`nSTART decoy.pb`n' from dual;`nselect q'[alternate SQL:`n@decoy.pb`n]' from dual;`n-- START decoy.pb`n/* START decoy.pb */" @{
         'sql\first.sql' = 'select 1 from dual;'; 'sql\second.pb' = 'select 2 from dual;'; 'sql\decoy.pb' = 'select 3 from dual;'
     }
     $controlAudit = Audit-Path $controlText
@@ -799,7 +799,7 @@ start support.txt
     Assert-Equal (Row $controlAudit 'sql\first.sql').DirectCallCount 1 'Early master call remains visible before control text'
     Assert-Equal (Row $controlAudit 'sql\second.pb').DirectCallCount 1 'START after unpaired control-text punctuation is detected'
     Assert-Equal (Row $controlAudit 'sql\decoy.pb').DirectCallCount 0 'Real SQL strings, alternate strings and comments still never count as calls'
-    $dynamicSql = New-TestRelease 'Multiline execute immediate' "@first.sql`nBEGIN`n  EXECUTE IMMEDIATE '`n    CREATE TABLE DA.UETD_FLY_EMAILS`n    (AUTHOR VARCHAR2(300))`n    -- START decoy.pb`n    START decoy.pb`n    /* @decoy.pb */`n    TABLESPACE USERS';`n  DBMS_OUTPUT.PUT_LINE('Table Created');`nEND;`n/`nselect 'TIMESTAMPER End Table Update' || to_char(systimestamp, 'YYYY-MON-DD HH24:MI:SSSS') `" `" from dual;`nSTART aputil.ps;`nstart uigtoolsmessage.dat`nstart JSR_PYCHK01C.pb`nUPDATE settings`nSET value = 'multiline value:`nSTART decoy.pb`n'`nWHERE code = 'X';`nSTART final.sql" @{
+    $dynamicSql = New-TestHotfix 'Multiline execute immediate' "@first.sql`nBEGIN`n  EXECUTE IMMEDIATE '`n    CREATE TABLE DA.UETD_FLY_EMAILS`n    (AUTHOR VARCHAR2(300))`n    -- START decoy.pb`n    START decoy.pb`n    /* @decoy.pb */`n    TABLESPACE USERS';`n  DBMS_OUTPUT.PUT_LINE('Table Created');`nEND;`n/`nselect 'TIMESTAMPER End Table Update' || to_char(systimestamp, 'YYYY-MON-DD HH24:MI:SSSS') `" `" from dual;`nSTART aputil.ps;`nstart uigtoolsmessage.dat`nstart JSR_PYCHK01C.pb`nUPDATE settings`nSET value = 'multiline value:`nSTART decoy.pb`n'`nWHERE code = 'X';`nSTART final.sql" @{
         'sql\first.sql' = 'select 1 from dual;'; 'sql\decoy.pb' = 'select 2 from dual;'
         'sql\aputil.ps' = 'select 3 from dual;'; 'uig\sql\uigtoolsmessage.dat' = 'select 4 from dual;'
         'uig\sql\JSR_PYCHK01C.pb' = 'select 5 from dual;'; 'sql\final.sql' = 'select 6 from dual;'
@@ -811,7 +811,7 @@ start support.txt
         Assert-Equal (Row $dynamicAudit $dynamicTarget).DirectCallCount 1 'Every active call after multiline dynamic SQL is retained'
     }
     Assert-Equal (Row $dynamicAudit 'sql\decoy.pb').DirectCallCount 0 'START-looking text inside dynamic SQL and UPDATE literals never counts'
-    $copiesRoot = New-TestRelease 'Cross-folder calls' "START APERROR.DAT`n@`"poerror.dat`"`nstart ..\uig\sql\explicit.pb`n@@caller.pb`nSTART missing\lookalike.pb`nPROMPT START decoy.pb`nselect 'START decoy.pb' from dual;" @{
+    $copiesRoot = New-TestHotfix 'Cross-folder calls' "START APERROR.DAT`n@`"poerror.dat`"`nstart ..\uig\sql\explicit.pb`n@@caller.pb`nSTART missing\lookalike.pb`nPROMPT START decoy.pb`nselect 'START decoy.pb' from dual;" @{
         'sql\aperror.dat' = 'DA data'; 'uig\sql\aperror.dat' = 'UIG data'; 'cf\sql\aperror.dat' = 'CF data'
         'sql\poerror.dat' = 'DA po'; 'uig\sql\poerror.dat' = 'UIG po'; 'sql\old_aperror.dat' = 'lookalike'
         'sql\explicit.pb' = 'wrong copy'; 'uig\sql\explicit.pb' = 'right copy'
@@ -820,7 +820,7 @@ start support.txt
     }
     $copiesAudit = Audit-Path $copiesRoot
     foreach ($copyPath in @('sql\aperror.dat','uig\sql\aperror.dat','cf\sql\aperror.dat','sql\poerror.dat','uig\sql\poerror.dat')) {
-        Assert-Equal (Row $copiesAudit $copyPath).DirectCallCount 1 'A bare filename directly called in the master covers every exact-name release copy'
+        Assert-Equal (Row $copiesAudit $copyPath).DirectCallCount 1 'A bare filename directly called in the master covers every exact-name hotfix copy'
         Assert-Equal (Row $copiesAudit $copyPath).MatchingMethod 'FilenamePresence' 'Multiple-copy matches retain their evidence method'
     }
     foreach ($wrongCopy in @('sql\old_aperror.dat','sql\explicit.pb','uig\sql\caller.pb','sql\lookalike.pb','uig\sql\decoy.pb')) {
@@ -831,16 +831,16 @@ start support.txt
     Assert-True ((Get-CoverageSummary $copiesAudit) -match 'Bare filenames.*all exact-name copies') 'Summary discloses multiple-copy filename coverage'
     $copiesNested = Audit-Path $copiesRoot $true
     Assert-True (-not $copiesNested.Cache.ContainsKey((Join-Path $copiesRoot 'uig\sql\aperror.dat'))) 'Nested parsing never reads an extra filename copy by guessing its runtime location'
-    $badBlock = New-TestRelease 'BadBlock' "/* unterminated`n@child.sql" @{ 'sql\child.sql' = 'select 1 from dual;' }
+    $badBlock = New-TestHotfix 'BadBlock' "/* unterminated`n@child.sql" @{ 'sql\child.sql' = 'select 1 from dual;' }
     Assert-Equal (Audit-Path $badBlock).ExitCode 2 'Unterminated block comment makes analysis incomplete'
     Assert-True ((Audit-Path $badBlock).Issues[0].Message -match 'block comment opened at line 1') 'Unclosed comment reports its opening line'
-    $badLiteral = New-TestRelease 'Bad literal' "-- heading`nselect 'unterminated`nSTART child.sql" @{ 'sql\child.sql' = 'select 1 from dual;' }
+    $badLiteral = New-TestHotfix 'Bad literal' "-- heading`nselect 'unterminated`nSTART child.sql" @{ 'sql\child.sql' = 'select 1 from dual;' }
     $badLiteralAudit = Audit-Path $badLiteral
     Assert-Equal (Row $badLiteralAudit 'sql\child.sql').DirectCallCount 0 'An unclosed real SQL literal does not count its embedded START text'
     Assert-True ($badLiteralAudit.Issues[0].Message -match "SQL literal opened at line 2.*select 'unterminated") 'Unclosed SQL literal reports its opening line and source'
-    $changedSyntax = New-TestRelease 'SyntaxSetting' "set def ^`n@child.sql" @{ 'sql\child.sql' = 'select 1 from dual;' }
+    $changedSyntax = New-TestHotfix 'SyntaxSetting' "set def ^`n@child.sql" @{ 'sql\child.sql' = 'select 1 from dual;' }
     Assert-Equal (Audit-Path $changedSyntax).References[0].Status 'Unresolved' 'Custom substitution setting prevents confident matching'
-    $standardDefine = New-TestRelease 'StandardDefine' "START first.pb`nset define on`n@second.ps`nset def off`n@second.ps`n@&dynamic" @{
+    $standardDefine = New-TestHotfix 'StandardDefine' "START first.pb`nset define on`n@second.ps`nset def off`n@second.ps`n@&dynamic" @{
         'sql\first.pb' = 'select 1 from dual;'; 'sql\second.ps' = 'select 2 from dual;'
     }
     $standardDefineAudit = Audit-Path $standardDefine
@@ -848,15 +848,15 @@ start support.txt
     Assert-Equal (Row $standardDefineAudit 'sql\second.ps').DirectCallCount 2 'SET DEFINE ON/OFF preserves literal calls after the settings'
     Assert-Equal $standardDefineAudit.Issues.Count 0 'Standard DEFINE toggles do not invalidate the parser'
     Assert-Equal @($standardDefineAudit.References | Where-Object { $_.Status -eq 'Unresolved' }).Count 1 'Variable-bearing call still requires review'
-    $nestedDefine = New-TestRelease 'NestedDefine' "@child.sql`n@leaf.pb" @{
+    $nestedDefine = New-TestHotfix 'NestedDefine' "@child.sql`n@leaf.pb" @{
         'sql\child.sql' = 'set define on'; 'sql\leaf.pb' = 'select 1 from dual;'
     }
     Assert-Equal (Audit-Path $nestedDefine $true).ExitCode 0 'Standard DEFINE toggle in a nested script preserves literal graph matches'
 
-    $foreign = New-TestRelease 'Foreign' '@payload.ps1' @{ 'sql\payload.ps1' = "throw 'Do not execute me'" }
+    $foreign = New-TestHotfix 'Foreign' '@payload.ps1' @{ 'sql\payload.ps1' = "throw 'Do not execute me'" }
     Assert-Equal (Audit-Path $foreign).ExitCode 0 'Any explicit extension remains eligible for direct matching'
     Assert-Equal (Audit-Path $foreign $true).ExitCode 2 'Unsupported nested language is incomplete'
-    $binary = New-TestRelease 'Binary' '@child.pb' @{ 'sql\child.pb' = 'placeholder' }
+    $binary = New-TestHotfix 'Binary' '@child.pb' @{ 'sql\child.pb' = 'placeholder' }
     [IO.File]::WriteAllBytes((Join-Path $binary 'sql\child.pb'), [byte[]]@(0, 1, 2, 3))
     Assert-Equal (Audit-Path $binary $true).ExitCode 2 'Binary nested content is incomplete'
 
@@ -874,7 +874,7 @@ start support.txt
     Assert-Equal $missingAudit.ExitCode 2 'Inaccessible/nonexistent root is failed'
 
     # BOMs override Auto. Auto tries UTF-8 first, then Windows-1252 per file.
-    $encoded = New-TestRelease 'Encoding' '@child.sql' @{ 'sql\child.sql' = 'select 1 from dual;' }
+    $encoded = New-TestHotfix 'Encoding' '@child.sql' @{ 'sql\child.sql' = 'select 1 from dual;' }
     Set-Content -LiteralPath (Join-Path $encoded 'sql\master.sql') -Value '@child.sql' -Encoding Unicode
     Assert-Equal (Audit-Path $encoded).ExitCode 0 'UTF-16 BOM detected'
     [IO.File]::WriteAllBytes((Join-Path $encoded 'sql\master.sql'), [byte[]]@(64, 99, 104, 105, 108, 100, 46, 115, 113, 108, 13, 10, 45, 45, 32, 233))
@@ -886,7 +886,7 @@ start support.txt
     $ScriptEncoding = 'UTF8'
 
     $ansiName = 'caf' + [char]0x00E9 + '.sql'
-    $ansiRoot = New-TestRelease 'ANSI master bytes' 'placeholder' @{
+    $ansiRoot = New-TestHotfix 'ANSI master bytes' 'placeholder' @{
         ('sql\' + $ansiName) = 'select 1 from dual;'; 'sql\child.sql' = 'select 2 from dual;'
     }
     $ansiMaster = Join-Path $ansiRoot 'sql\master.sql'
@@ -905,15 +905,15 @@ start support.txt
     Assert-Equal $ansiAudit.ExitCode 0 'Explicit Windows1252 parses the entire A0-bearing master'
     Assert-Equal (Row $ansiAudit ('sql\' + $ansiName)).DirectCallCount 1 'Windows1252 preserves an accented target filename'
     Assert-Equal (Row $ansiAudit 'sql\child.sql').DirectCallCount 1 'Calls after the A0 byte remain checked'
-    $ansiBomRoot = New-TestRelease 'ANSI option BOM override' ('@' + $ansiName) @{ ('sql\' + $ansiName) = 'select 1 from dual;' }
+    $ansiBomRoot = New-TestHotfix 'ANSI option BOM override' ('@' + $ansiName) @{ ('sql\' + $ansiName) = 'select 1 from dual;' }
     Assert-Equal (Audit-Path $ansiBomRoot).ExitCode 0 'UTF-8 BOM overrides an explicitly selected Windows1252 encoding'
-    $binaryRoot = New-TestRelease 'ANSI binary guard' 'placeholder' @{}
+    $binaryRoot = New-TestHotfix 'ANSI binary guard' 'placeholder' @{}
     [IO.File]::WriteAllBytes((Join-Path $binaryRoot 'sql\master.sql'), [byte[]]@(64, 0, 65))
     Assert-Equal (Audit-Path $binaryRoot).ExitCode 2 'Explicit ANSI decoding retains binary/NUL rejection'
     $ScriptEncoding = 'Auto'
     Assert-Equal (Get-FileHash -LiteralPath $ansiMaster -Algorithm SHA256).Hash $ansiHash 'Encoding choices never change source script bytes'
 
-    $linkRoot = New-TestRelease 'Links' 'select 1 from dual;' @{}
+    $linkRoot = New-TestHotfix 'Links' 'select 1 from dual;' @{}
     $targetRoot = Join-Path $work 'ExternalLinkTarget'
     [void](New-Item -ItemType Directory -Path $targetRoot)
     Set-Content -LiteralPath (Join-Path $targetRoot 'external.sql') -Value 'select 1 from dual;'
@@ -936,7 +936,7 @@ start support.txt
     Assert-True (-not (Test-PathLink ([pscustomobject]@{ Attributes = [IO.FileAttributes]::ReparsePoint; LinkType = ''; Target = @() }))) 'Cloud placeholders retain ordinary-file behavior'
 
     $longPlainLine = 'select ' + [string]::new('a', 100000) + ' from dual;'
-    $plainSqlRoot = New-TestRelease 'Plain SQL workload' ($longPlainLine + "`nPROMPT @decoy.pb`n@payload.pb") @{
+    $plainSqlRoot = New-TestHotfix 'Plain SQL workload' ($longPlainLine + "`nPROMPT @decoy.pb`n@payload.pb") @{
         'sql\payload.pb' = 'select 1 from dual;'; 'sql\decoy.pb' = 'select 2 from dual;'
     }
     $plainSqlAudit = Audit-Path $plainSqlRoot
@@ -944,20 +944,20 @@ start support.txt
     Assert-Equal (Row $plainSqlAudit 'sql\decoy.pb').DirectCallCount 0 'Free-text commands remain excluded in optimized lexing'
 
     Write-Host 'Core assertions passed; checking real launcher, reports and automation exits.'
-    $cleanRun = Run-Cli @('-ReleasePath', (Join-Path $fixtures 'Clean'), '-MasterPath', 'sql\master.sql', '-NonInteractive') 'clean-batch' $true
+    $cleanRun = Run-Cli @('-HotfixPath', (Join-Path $fixtures 'Clean'), '-MasterPath', 'sql\master.sql', '-NonInteractive') 'clean-batch' $true
     Assert-Equal $cleanRun.ExitCode 0 'BAT launcher preserves exit zero and accepts spaces'
     Assert-Equal @(Get-ChildItem -LiteralPath $cleanRun.Folder -File).Count 1 'Default run creates exactly one file'
     $cleanSummary = Get-Content -Raw -LiteralPath $cleanRun.SummaryPath
     Assert-True ($cleanSummary -match 'Result: YES - all checked files are called by the master\.' -and $cleanSummary -match 'Files called by master: 1' -and $cleanSummary -match 'Files with no matching call: 0') 'Clean summary directly answers file coverage'
     Assert-True ((Get-Content -Raw -LiteralPath $cleanRun.Log).Contains($cleanSummary.TrimEnd())) 'CMD prints the same summary saved in the TXT'
     Assert-True ($cleanSummary -match '0KB files were not found\.') 'A real clean CMD run explicitly reports no zero-byte files'
-    $zeroRun = Run-Cli @('-ReleasePath', $zeroRoot, '-MasterPath', 'sql\master.sql') 'zero-byte-cmd' $true
+    $zeroRun = Run-Cli @('-HotfixPath', $zeroRoot, '-MasterPath', 'sql\master.sql') 'zero-byte-cmd' $true
     Assert-Equal $zeroRun.ExitCode 1 'Normal CMD mode keeps zero-byte findings even when call coverage passes'
     Assert-True ((Get-Content -Raw -LiteralPath $zeroRun.SummaryPath) -match '0KB files found: 7') 'Real CMD output includes the recursive zero-byte count'
-    $ignoredZeroRun = Run-Cli @('-ReleasePath', $ignoredOnlyRoot, '-MasterPath', 'sql\master.sql') 'ignored-zero-byte-cmd' $true
+    $ignoredZeroRun = Run-Cli @('-HotfixPath', $ignoredOnlyRoot, '-MasterPath', 'sql\master.sql') 'ignored-zero-byte-cmd' $true
     Assert-Equal $ignoredZeroRun.ExitCode 0 'The four ignored empty-file extensions do not fail a real CMD run'
     $cliDocHotfix = 'V12-023-2-02-HF-ALC-07'
-    $cliDocRoot = New-TestRelease $cliDocHotfix ("@empty.sql`n@" + $cliDocHotfix + '.docx') @{
+    $cliDocRoot = New-TestHotfix $cliDocHotfix ("@empty.sql`n@" + $cliDocHotfix + '.docx') @{
         'sql\empty.sql' = 'placeholder'
         'documentation\V12-022-2-02-HF-BLC-01.docx' = 'placeholder'
         'documentation\Hotfix Installation Instructions for V12C.docx' = 'Keep the installation instructions.'
@@ -967,23 +967,23 @@ start support.txt
     $cliDocHash = (Get-FileHash -LiteralPath (Join-Path $cliDocRoot 'documentation\V12-022-2-02-HF-BLC-01.docx') -Algorithm SHA256).Hash
     $cliInstructions = Join-Path $cliDocRoot 'documentation\Hotfix Installation Instructions for V12C.docx'
     $cliInstructionsHash = (Get-FileHash -LiteralPath $cliInstructions -Algorithm SHA256).Hash
-    $cliDocRun = Run-Cli @('-ReleasePath', $cliDocRoot, '-MasterPath', 'sql\master.sql') 'documentation-and-zero' $true
+    $cliDocRun = Run-Cli @('-HotfixPath', $cliDocRoot, '-MasterPath', 'sql\master.sql') 'documentation-and-zero' $true
     Assert-Equal $cliDocRun.ExitCode 1 'Real CMD mode renames the hotfix document and reports empty SQL files'
-    Assert-Equal (Get-FileHash -LiteralPath (Join-Path $cliDocRoot ('documentation\' + $cliDocHotfix + '.docx')) -Algorithm SHA256).Hash $cliDocHash 'Real CMD mode preserves document bytes while changing its release/build name'
+    Assert-Equal (Get-FileHash -LiteralPath (Join-Path $cliDocRoot ('documentation\' + $cliDocHotfix + '.docx')) -Algorithm SHA256).Hash $cliDocHash 'Real CMD mode preserves document bytes while changing its hotfix/build name'
     Assert-Equal (Get-FileHash -LiteralPath $cliInstructions -Algorithm SHA256).Hash $cliInstructionsHash 'Real CMD mode leaves the installation instructions untouched'
     $cliDocSummary = Get-Content -Raw -LiteralPath $cliDocRun.SummaryPath
     Assert-True ($cliDocSummary -match 'Documentation renamed:' -and $cliDocSummary -match '0KB files found: 1' -and $cliDocSummary -match '(?m)^  sql\\empty.sql\r?$') 'The saved summary includes the DOCX rename and exact zero-byte path'
     Assert-True ($cliDocSummary -match 'Required calls missing files: 0') 'Real master call resolution sees the renamed DOCX before checking targets'
     Assert-True ((Get-Content -Raw -LiteralPath $cliDocRun.Log).Contains($cliDocSummary.TrimEnd())) 'CMD and TXT contain identical documentation and zero-byte results'
-    $cliDocDetailed = Run-Cli @('-ReleasePath', $cliDocRoot, '-MasterPath', 'sql\master.sql', '-DetailedReport') 'documentation-and-zero-details'
+    $cliDocDetailed = Run-Cli @('-HotfixPath', $cliDocRoot, '-MasterPath', 'sql\master.sql', '-DetailedReport') 'documentation-and-zero-details'
     Assert-Equal $cliDocDetailed.ExitCode 1 'Detailed mode preserves zero-byte findings on a rerun'
     $cliDocDetailedSummary = Get-Content -Raw -LiteralPath $cliDocDetailed.SummaryPath
     Assert-True ($cliDocDetailedSummary -match '0KB file check' -and $cliDocDetailedSummary -notmatch 'Documentation renamed:') 'Detailed reruns retain zero-byte reporting without repeating an already matching DOCX rename'
     Assert-True ((Get-Content -Raw -LiteralPath $cliDocDetailed.CombinedPath) -match '0KB files found: 1') 'Detailed combined totals include zero-byte findings'
-    Assert-Equal (Split-Path -Leaf $cleanRun.SummaryPath) 'summary_Clean.txt' 'Normal summary filename uses the release folder name'
+    Assert-Equal (Split-Path -Leaf $cleanRun.SummaryPath) 'summary_Clean.txt' 'Normal summary filename uses the hotfix folder name'
     Assert-True ((Split-Path -Leaf $cleanRun.Folder) -match '^\d{8}_\d{4}(AM|PM)_Clean$') 'Normal report folder has the requested readable date, time and hotfix name'
     $exampleHotfix = 'V12-020-2-02N-HF-AMI-16'
-    $exampleRoot = New-TestRelease $exampleHotfix '@child.sql' @{
+    $exampleRoot = New-TestHotfix $exampleHotfix '@child.sql' @{
         'sql\child.sql' = 'select 1 from dual;'
         'v12hotfixinstall\v12hotfixinstall.pl' = '# Preserve this header.'
     }
@@ -991,7 +991,7 @@ start support.txt
     $exampleOriginal = '# Preserve this header.' + "`r`n" + 'my $hotfix = "V12-YYY-Y-YY-HF-YYY-YY"; # Preserve this comment.' + "`r`n"
     [IO.File]::WriteAllText($exampleInstaller, $exampleOriginal, [Text.UTF8Encoding]::new($false))
     $timeBeforeRun = Get-ReportTimestamp
-    $exampleRun = Run-Cli @('-ReleasePath', $exampleRoot, '-MasterPath', 'sql\master.sql') 'named-hotfix' $true
+    $exampleRun = Run-Cli @('-HotfixPath', $exampleRoot, '-MasterPath', 'sql\master.sql') 'named-hotfix' $true
     $timeAfterRun = Get-ReportTimestamp
     Assert-Equal $exampleRun.ExitCode 0 'A real CMD run synchronizes the installer and completes both checks'
     Assert-Equal (Split-Path -Leaf $exampleRun.SummaryPath) ('summary_' + $exampleHotfix + '.txt') 'The exact user-supplied hotfix example is used in the summary filename'
@@ -1003,23 +1003,23 @@ start support.txt
     $firstReportHash = (Get-FileHash -LiteralPath $exampleRun.SummaryPath -Algorithm SHA256).Hash
     $exampleInstallerHash = (Get-FileHash -LiteralPath $exampleInstaller -Algorithm SHA256).Hash
     $exampleInstallerTime = [IO.File]::GetLastWriteTimeUtc($exampleInstaller)
-    $exampleRerun = Run-Cli @('-ReleasePath', $exampleRoot, '-MasterPath', 'sql\master.sql') 'named-hotfix' $true
+    $exampleRerun = Run-Cli @('-HotfixPath', $exampleRoot, '-MasterPath', 'sql\master.sql') 'named-hotfix' $true
     Assert-Equal $exampleRerun.ExitCode 0 'A real CMD rerun skips an already matching installer'
     Assert-Equal $exampleRerun.SummaryPaths.Count 2 'A repeated CMD run creates another named summary instead of overwriting the first'
     Assert-Equal (Get-FileHash -LiteralPath $exampleRun.SummaryPath -Algorithm SHA256).Hash $firstReportHash 'The first named summary remains unchanged after a rerun'
     Assert-Equal (Get-FileHash -LiteralPath $exampleInstaller -Algorithm SHA256).Hash $exampleInstallerHash 'A real CMD rerun leaves a matching installer unchanged'
     Assert-Equal ([IO.File]::GetLastWriteTimeUtc($exampleInstaller).Ticks) $exampleInstallerTime.Ticks 'A real CMD rerun preserves a matching installer modification time'
     $progressLog = Get-Content -Raw -LiteralPath $cleanRun.Log
-    Assert-True ($progressLog -match '(?s)Validating release and master paths.*Scanning release folders.*Inventory complete: 2 files.*Reading master and checking calls.*Preparing coverage results.*Saving summary') 'Real CMD run reports validation, inventory, parsing, and writing stages'
+    Assert-True ($progressLog -match '(?s)Validating hotfix and master paths.*Scanning hotfix folders.*Inventory complete: 2 files.*Reading master and checking calls.*Preparing coverage results.*Saving summary') 'Real CMD run reports validation, inventory, parsing, and writing stages'
     Assert-True ($cleanSummary -notmatch 'Detected resolved calls|CallChains|Unresolved / manual review|combined totals') 'Default summary omits detailed call trace sections'
     $cliHookHotfix = 'V12-023-2-02-HF-AMA-27'
     $cliHookFiles = @{ 'sql\payload.pb' = 'select 1 from dual;' }
     foreach ($suffix in $hookSuffixes) { $cliHookFiles['sql\' + $oldHookPrefix + '.' + $suffix] = '# Real CMD hook rename for ' + $suffix }
     $cliHookMaster = "@payload.pb`n" + (($hookSuffixes | ForEach-Object { 'START ' + $cliHookHotfix + '.' + $_ }) -join "`n")
-    $cliHookRoot = New-TestRelease $cliHookHotfix $cliHookMaster $cliHookFiles
+    $cliHookRoot = New-TestHotfix $cliHookHotfix $cliHookMaster $cliHookFiles
     $cliHookHashes = @{}
     foreach ($suffix in $hookSuffixes) { $cliHookHashes[$suffix] = (Get-FileHash -LiteralPath (Join-Path $cliHookRoot ('sql\' + $oldHookPrefix + '.' + $suffix)) -Algorithm SHA256).Hash }
-    $cliHookRun = Run-Cli @('-ReleasePath', $cliHookRoot, '-MasterPath', 'sql\master.sql') 'hook-renames' $true
+    $cliHookRun = Run-Cli @('-HotfixPath', $cliHookRoot, '-MasterPath', 'sql\master.sql') 'hook-renames' $true
     Assert-Equal $cliHookRun.ExitCode 0 'The real CMD launcher renames all hooks before checking master call targets'
     foreach ($suffix in $hookSuffixes) {
         Assert-Equal (Get-FileHash -LiteralPath (Join-Path $cliHookRoot ('sql\' + $cliHookHotfix + '.' + $suffix)) -Algorithm SHA256).Hash $cliHookHashes[$suffix] 'The real CMD workflow preserves hook bytes under the new name'
@@ -1028,50 +1028,50 @@ start support.txt
     Assert-Equal @([regex]::Matches($cliHookSummary, '(?m)^Script renamed:')).Count 5 'The saved summary records exactly the five actual hook renames'
     Assert-True ((Get-Content -Raw -LiteralPath $cliHookRun.Log).Contains($cliHookSummary.TrimEnd())) 'The hook rename results match between CMD and TXT'
     Assert-True ($cliHookSummary -match ('(?m)^Executed by: ' + [regex]::Escape([Environment]::UserName) + '\r?$')) 'Hook rename summaries retain the current execution username'
-    $cliHookRerun = Run-Cli @('-ReleasePath', $cliHookRoot, '-MasterPath', 'sql\master.sql') 'hook-renames' $true
+    $cliHookRerun = Run-Cli @('-HotfixPath', $cliHookRoot, '-MasterPath', 'sql\master.sql') 'hook-renames' $true
     Assert-Equal $cliHookRerun.ExitCode 0 'The CMD workflow skips already renamed hooks on a repeated run'
     Assert-True ((Get-Content -Raw -LiteralPath $cliHookRerun.SummaryPath) -notmatch 'Script renamed:') 'A repeated CMD run does not print redundant rename messages'
     Assert-True ($cleanSummary -match 'File presence result: YES' -and $cleanSummary -match 'Required calls missing files: 0') 'A clean real CMD run checks master targets too'
-    $presenceRun = Run-Cli @('-ReleasePath', $presenceRoot, '-MasterPath', 'sql\master.sql') 'presence-batch' $true
+    $presenceRun = Run-Cli @('-HotfixPath', $presenceRoot, '-MasterPath', 'sql\master.sql') 'presence-batch' $true
     Assert-Equal $presenceRun.ExitCode 1 'Missing master targets fail a normal CMD run even when every supplied file is called'
     $presenceTxt = Get-Content -Raw -LiteralPath $presenceRun.SummaryPath
     Assert-True ($presenceTxt -match 'Result: YES - all checked files are called' -and $presenceTxt -match 'File presence result: NO - 3 required call') 'The two checks show independent results'
     Assert-True ($presenceTxt -match 'Allowed missing calls ignored: 4') 'Saved summary distinguishes ignored absences'
     Assert-True ($presenceTxt -notmatch 'Ignored missing calls \(allowed list\)|Master calls requiring (manual )?review:|unsupported or empty target') 'Real CMD/TXT summary omits both redundant lists'
     Assert-True ((Get-Content -Raw -LiteralPath $presenceRun.Log).Contains($presenceTxt.TrimEnd())) 'CMD and TXT show the same new section'
-    $allowedRun = Run-Cli @('-ReleasePath', $allowedRoot, '-MasterPath', 'sql\master.sql') 'allowed-batch' $true
+    $allowedRun = Run-Cli @('-HotfixPath', $allowedRoot, '-MasterPath', 'sql\master.sql') 'allowed-batch' $true
     Assert-Equal $allowedRun.ExitCode 0 'All supplied exceptions pass in a real normal CMD run'
     $allowedOutput = Get-Content -Raw -LiteralPath $allowedRun.Log
     Assert-True ($allowedOutput -match 'Allowed missing calls ignored: 93' -and $allowedOutput -notmatch 'dbdefine\.sql|ptfcompx|invalidobjects\.sql|Ignored missing calls \(allowed list\)') 'Real CMD run prints only the allowed missing count without the ignored filenames'
-    $manualRun = Run-Cli @('-ReleasePath', $manual, '-MasterPath', 'sql\master.sql') 'concise-unresolved'
+    $manualRun = Run-Cli @('-HotfixPath', $manual, '-MasterPath', 'sql\master.sql') 'concise-unresolved'
     Assert-Equal $manualRun.ExitCode 2 'Concise unresolved output preserves an incomplete exit code'
     $manualTxt = Get-Content -Raw -LiteralPath $manualRun.SummaryPath
     Assert-True ($manualTxt -match 'Master calls checked: 5' -and $manualTxt -match '4 script call\(s\) could not be resolved' -and $manualTxt -notmatch 'Master calls requiring (manual )?review:|unsupported or empty target') 'Real normal run reports actual script-call counts and a short uncertainty note'
     Assert-True ((Get-Content -Raw -LiteralPath $manualRun.Log).Contains($manualTxt.TrimEnd())) 'Concise unresolved CMD output matches its saved TXT'
-    $allowedDetailedRun = Run-Cli @('-ReleasePath', $allowedRoot, '-MasterPath', 'sql\master.sql', '-DetailedReport') 'allowed-details'
+    $allowedDetailedRun = Run-Cli @('-HotfixPath', $allowedRoot, '-MasterPath', 'sql\master.sql', '-DetailedReport') 'allowed-details'
     Assert-Equal $allowedDetailedRun.ExitCode 0 'Allowed missing calls also pass in detailed mode'
     $allowedCsv = @(Import-Csv -LiteralPath (Join-Path $allowedDetailedRun.Folder '01_Allowed_missing_targets_references.csv'))
     Assert-Equal @($allowedCsv | Where-Object { $_.Status -eq 'IgnoredMissing' }).Count 93 'Detailed references retain allowed-call evidence with a distinct status'
     Assert-True ((Get-Content -Raw -LiteralPath $allowedDetailedRun.SummaryPath) -match 'Master call file check') 'Detailed text includes the new presence section'
     Assert-True ((Get-Content -Raw -LiteralPath $allowedDetailedRun.SummaryPath) -notmatch 'Ignored missing calls \(allowed list\):') 'Detailed text also omits the repeated ignored-call list'
-    $ansiAutoRun = Run-Cli @('-ReleasePath', $ansiRoot, '-MasterPath', 'sql\master.sql', '-NonInteractive') 'ansi-auto-cmd' $true
+    $ansiAutoRun = Run-Cli @('-HotfixPath', $ansiRoot, '-MasterPath', 'sql\master.sql', '-NonInteractive') 'ansi-auto-cmd' $true
     Assert-Equal $ansiAutoRun.ExitCode 0 'CMD automatic encoding completes without an encoding response'
     Assert-True ((Get-Content -Raw -LiteralPath $ansiAutoRun.SummaryPath) -match 'Encoding fallback:.*Windows1252' ) 'Automatic encoding choice is recorded in the single summary'
     Assert-True ((Get-Content -Raw -LiteralPath $ansiAutoRun.Log) -notmatch 'Encoding retry Y/N|Retry this file') 'Automatic CMD run never requests encoding confirmation'
-    $ansiFailureRun = Run-Cli @('-ReleasePath', $ansiRoot, '-MasterPath', 'sql\master.sql', '-ScriptEncoding', 'UTF8') 'ansi-guidance'
+    $ansiFailureRun = Run-Cli @('-HotfixPath', $ansiRoot, '-MasterPath', 'sql\master.sql', '-ScriptEncoding', 'UTF8') 'ansi-guidance'
     Assert-Equal $ansiFailureRun.ExitCode 2 'Real process keeps incomplete status for invalid UTF-8'
-    Assert-True ((Get-Content -Raw -LiteralPath $ansiFailureRun.SummaryPath) -match 'Check-Release.bat -ScriptEncoding Default') 'Saved failed summary includes the executable ANSI workaround'
+    Assert-True ((Get-Content -Raw -LiteralPath $ansiFailureRun.SummaryPath) -match 'Hotfix-Checker.bat -ScriptEncoding Default') 'Saved failed summary includes the executable ANSI workaround'
     Assert-True ((Get-Content -Raw -LiteralPath $ansiFailureRun.Log) -notmatch 'Retry this file as Windows-1252\?') 'Batch paths never prompt for an encoding retry'
-    $ansiSuccessRun = Run-Cli @('-ReleasePath', $ansiRoot, '-MasterPath', 'sql\master.sql', '-ScriptEncoding', 'Windows1252') 'ansi-cmd' $true
+    $ansiSuccessRun = Run-Cli @('-HotfixPath', $ansiRoot, '-MasterPath', 'sql\master.sql', '-ScriptEncoding', 'Windows1252') 'ansi-cmd' $true
     Assert-Equal $ansiSuccessRun.ExitCode 0 'CMD launcher forwards the explicit Windows1252 encoding'
     Assert-True ((Get-Content -Raw -LiteralPath $ansiSuccessRun.SummaryPath) -match 'Files called by master: 2') 'Explicit ANSI CMD run reports the complete file coverage'
-    $uncalledRoot = New-TestRelease 'UncalledFile' 'select 1 from dual;' @{ 'sql\unused.sql' = 'select 2 from dual;' }
-    $findingRun = Run-Cli @('-ReleasePath', $uncalledRoot, '-MasterPath', 'sql\master.sql') 'findings-batch' $true
+    $uncalledRoot = New-TestHotfix 'UncalledFile' 'select 1 from dual;' @{ 'sql\unused.sql' = 'select 2 from dual;' }
+    $findingRun = Run-Cli @('-HotfixPath', $uncalledRoot, '-MasterPath', 'sql\master.sql') 'findings-batch' $true
     Assert-Equal $findingRun.ExitCode 1 'BAT launcher preserves findings exit one'
     $findingSummary = Get-Content -Raw -LiteralPath $findingRun.SummaryPath
     Assert-True ($findingSummary -match 'Result: NO - 1 file\(s\)' -and $findingSummary -match '  sql\\unused\.sql') 'Missing coverage is clearly identified by relative filename'
     Assert-True ($findingSummary -notmatch '\[NoDirectReferenceFound; NotChecked\]') 'Missing file list has no internal status annotations'
-    $simplePartial = Run-Cli @('-ReleasePath', (Join-Path $fixtures 'Release one'), '-MasterPath', 'sql\master.sql') 'simple-incomplete' $true
+    $simplePartial = Run-Cli @('-HotfixPath', (Join-Path $fixtures 'Hotfix one'), '-MasterPath', 'sql\master.sql') 'simple-incomplete' $true
     $partialSummary = Get-Content -Raw -LiteralPath $simplePartial.SummaryPath
     Assert-Equal $simplePartial.ExitCode 2 'Simple summary preserves incomplete coverage status'
     Assert-Equal @(Get-ChildItem -LiteralPath $simplePartial.Folder -File).Count 1 'Incomplete default run still creates only one TXT'
@@ -1080,106 +1080,106 @@ start support.txt
     $partialList = ($partialSummary -split '(?m)^\*  Files with no matching call in the master +\*\r?\n\*+\r?\n')[1] -split '\r?\n\r?\n\*+\r?\n\*  Master call file check' | Select-Object -First 1
     Assert-Equal @($partialList -split '\r?\n' | Where-Object { $_.Trim() }).Count 11 'All 11 uncalled files appear once in the plain list'
     Assert-True ($partialList -match '(?m)^  sql\\subfolder\\indirect\.sql\r?$' -and $partialList -notmatch '(?m)^  sql\\py_post\.pb\r?$') 'List includes indirectly called files and excludes direct matches'
-    $coveredExtras = New-TestRelease 'CoveredExtras' "@child.sql`n@child.sql`n@not-in-release.sql" @{ 'sql\child.sql' = 'select 1 from dual;' }
-    $coverageOnly = Run-Cli @('-ReleasePath', $coveredExtras, '-MasterPath', 'sql\master.sql') 'coverage-only'
-    Assert-Equal $coverageOnly.ExitCode 1 'Default mode reports required call targets missing from the release'
-    $repeatedOnlyRoot = New-TestRelease 'Repeated present target' "@child.sql`n@child.sql" @{ 'sql\child.sql' = 'select 1 from dual;' }
-    $repeatedOnly = Run-Cli @('-ReleasePath', $repeatedOnlyRoot, '-MasterPath', 'sql\master.sql') 'repeated-present'
+    $coveredExtras = New-TestHotfix 'CoveredExtras' "@child.sql`n@child.sql`n@not-in-hotfix.sql" @{ 'sql\child.sql' = 'select 1 from dual;' }
+    $coverageOnly = Run-Cli @('-HotfixPath', $coveredExtras, '-MasterPath', 'sql\master.sql') 'coverage-only'
+    Assert-Equal $coverageOnly.ExitCode 1 'Default mode reports required call targets missing from the hotfix'
+    $repeatedOnlyRoot = New-TestHotfix 'Repeated present target' "@child.sql`n@child.sql" @{ 'sql\child.sql' = 'select 1 from dual;' }
+    $repeatedOnly = Run-Cli @('-HotfixPath', $repeatedOnlyRoot, '-MasterPath', 'sql\master.sql') 'repeated-present'
     Assert-Equal $repeatedOnly.ExitCode 0 'Repeated calls alone still pass both normal checks'
-    $detailedExtras = Run-Cli @('-ReleasePath', $coveredExtras, '-MasterPath', 'sql\master.sql', '-DetailedReport') 'covered-details'
+    $detailedExtras = Run-Cli @('-HotfixPath', $coveredExtras, '-MasterPath', 'sql\master.sql', '-DetailedReport') 'covered-details'
     Assert-Equal $detailedExtras.ExitCode 1 'Detailed mode retains extra-target and repetition findings'
-    $nestedRun = Run-Cli @('-ReleasePath', (Join-Path $fixtures 'Release one'), '-MasterPath', 'sql\master.sql', '-IncludeNested', '-DetailedReport') 'nested-batch' $true
+    $nestedRun = Run-Cli @('-HotfixPath', (Join-Path $fixtures 'Hotfix one'), '-MasterPath', 'sql\master.sql', '-IncludeNested', '-DetailedReport') 'nested-batch' $true
     Assert-Equal $nestedRun.ExitCode 2 'BAT launcher preserves incomplete exit two'
-    $fileCsv = @(Import-Csv -LiteralPath (Join-Path $nestedRun.Folder '01_Release_one_files.csv'))
-    $refCsv = @(Import-Csv -LiteralPath (Join-Path $nestedRun.Folder '01_Release_one_references.csv'))
+    $fileCsv = @(Import-Csv -LiteralPath (Join-Path $nestedRun.Folder '01_Hotfix_one_files.csv'))
+    $refCsv = @(Import-Csv -LiteralPath (Join-Path $nestedRun.Folder '01_Hotfix_one_references.csv'))
     Assert-Equal $fileCsv.Count 27 'Report has exactly one row per eligible file'
     Assert-Equal $refCsv.Count 25 'References CSV contains every matching file for direct and reached calls'
     Assert-Equal @($fileCsv | Where-Object { $_.AuditStatus -eq 'Incomplete' }).Count 27 'Export preserves audit status'
     Assert-True ((Get-Content -Raw -LiteralPath $nestedRun.SummaryPath) -match 'Unresolved / manual review') 'Text report includes manual review section'
     Assert-True ((Get-Content -Raw -LiteralPath $nestedRun.Log) -match [regex]::Escape($nestedRun.Folder)) 'Console shows full report paths'
     Assert-True ((Get-Content -Raw -LiteralPath $nestedRun.Log) -notmatch 'Press Enter to close this window') 'Noninteractive automation has no final wait'
-    $repeatRun = Run-Cli @('-ReleasePath', (Join-Path $fixtures 'Clean'), '-MasterPath', 'sql\master.sql') 'clean-batch' $true
+    $repeatRun = Run-Cli @('-HotfixPath', (Join-Path $fixtures 'Clean'), '-MasterPath', 'sql\master.sql') 'clean-batch' $true
     Assert-True ($repeatRun.Folder -ne $cleanRun.Folder -or @(Get-ChildItem -LiteralPath (Split-Path -Parent $cleanRun.Folder) -Directory).Count -eq 2) 'Previous run is preserved'
 
     $inputFile = Join-Path $work 'inputs.csv'
     @(
-        [pscustomobject]@{ ReleasePath = (Join-Path $fixtures 'Release one'); MasterPath = 'sql\master.sql'; WorkingDirectory = '' },
-        [pscustomobject]@{ ReleasePath = (Join-Path $fixtures 'Release two'); MasterPath = 'sql\master.sql'; WorkingDirectory = '' },
-        [pscustomobject]@{ ReleasePath = $gone; MasterPath = 'sql\master.sql'; WorkingDirectory = '' }
+        [pscustomobject]@{ HotfixPath = (Join-Path $fixtures 'Hotfix one'); MasterPath = 'sql\master.sql'; WorkingDirectory = '' },
+        [pscustomobject]@{ HotfixPath = (Join-Path $fixtures 'Hotfix two'); MasterPath = 'sql\master.sql'; WorkingDirectory = '' },
+        [pscustomobject]@{ HotfixPath = $gone; MasterPath = 'sql\master.sql'; WorkingDirectory = '' }
     ) | Export-Csv -LiteralPath $inputFile -NoTypeInformation -Encoding UTF8
     $simpleMulti = Run-Cli @('-InputCsv', $inputFile) 'simple-multiple'
-    Assert-Equal $simpleMulti.ExitCode 2 'Separate summaries preserve invalid release status while checking other releases'
-    Assert-Equal $simpleMulti.SummaryPaths.Count 3 'Every selected release gets its own summary'
-    Assert-Equal @(Get-ChildItem -LiteralPath $simpleMulti.ReportRoot -Directory).Count 3 'Every selected release gets its own report folder'
+    Assert-Equal $simpleMulti.ExitCode 2 'Separate summaries preserve invalid hotfix status while checking other hotfixes'
+    Assert-Equal $simpleMulti.SummaryPaths.Count 3 'Every selected hotfix gets its own summary'
+    Assert-Equal @(Get-ChildItem -LiteralPath $simpleMulti.ReportRoot -Directory).Count 3 'Every selected hotfix gets its own report folder'
     $multiSummary = ($simpleMulti.SummaryPaths | ForEach-Object { Get-Content -Raw -LiteralPath $_ }) -join "`n"
-    Assert-Equal @([regex]::Matches($multiSummary, '(?m)^Release:')).Count 3 'The separate summaries cover every selected release'
-    Assert-True ((Get-Content -Raw -LiteralPath $simpleMulti.Log) -match 'Releases checked: 3' -and $multiSummary -match 'Result: COULD NOT CHECK') 'Failed release cannot look like complete zero-file coverage'
+    Assert-Equal @([regex]::Matches($multiSummary, '(?m)^Hotfix:')).Count 3 'The separate summaries cover every selected hotfix'
+    Assert-True ((Get-Content -Raw -LiteralPath $simpleMulti.Log) -match 'Hotfixes checked: 3' -and $multiSummary -match 'Result: COULD NOT CHECK') 'Failed hotfix cannot look like complete zero-file coverage'
     foreach ($summaryFile in $simpleMulti.SummaryPaths) {
         $savedSummary = Get-Content -Raw -LiteralPath $summaryFile
-        Assert-True ((Get-Content -Raw -LiteralPath $simpleMulti.Log).Contains($savedSummary.TrimEnd())) 'Multiple-release CMD output matches each saved summary'
-        Assert-Equal @([regex]::Matches($savedSummary, '(?m)^Release:')).Count 1 'Each summary describes exactly one release'
+        Assert-True ((Get-Content -Raw -LiteralPath $simpleMulti.Log).Contains($savedSummary.TrimEnd())) 'Multiple-hotfix CMD output matches each saved summary'
+        Assert-Equal @([regex]::Matches($savedSummary, '(?m)^Hotfix:')).Count 1 'Each summary describes exactly one hotfix'
         Assert-Equal @(Get-ChildItem -LiteralPath (Split-Path -Parent $summaryFile) -File).Count 1 'A normal hotfix report folder contains only its own TXT'
     }
     $multi = Run-Cli @('-InputCsv', $inputFile, '-DetailedReport') 'multiple'
     Assert-Equal $multi.ExitCode 2 'Combined incomplete status takes precedence'
-    Assert-Equal @(Get-ChildItem -LiteralPath $multi.ReportRoot -Filter '*_files.csv' -Recurse -File).Count 3 'Independent report for each release including invalid release'
+    Assert-Equal @(Get-ChildItem -LiteralPath $multi.ReportRoot -Filter '*_files.csv' -Recurse -File).Count 3 'Independent report for each hotfix including invalid hotfix'
     $combined = Get-Content -Raw -LiteralPath $multi.CombinedPath
-    Assert-True ($combined -match 'Releases reviewed: 3' -and $combined -match 'Eligible files checked: 27' -and $combined -match 'Files directly referenced: 16') 'Combined totals are correct and readable'
-    Assert-True ($combined -match 'Ambiguous references: 0' -and $combined -match 'Call targets not found within scanned releases: 3') 'Combined reference findings are totaled'
+    Assert-True ($combined -match 'Hotfixes reviewed: 3' -and $combined -match 'Eligible files checked: 27' -and $combined -match 'Files directly referenced: 16') 'Combined totals are correct and readable'
+    Assert-True ($combined -match 'Ambiguous references: 0' -and $combined -match 'Call targets not found within scanned hotfixes: 3') 'Combined reference findings are totaled'
     Assert-True ($combined -match 'Files referenced only indirectly: Not checked') 'Direct-only combined report does not imply nested checking'
     $failedCsv = Get-ChildItem -LiteralPath $multi.ReportRoot -Filter '03_Nonexistent_files.csv' -Recurse -File | Select-Object -First 1
     Assert-Equal @(Import-Csv -LiteralPath $failedCsv.FullName).Count 0 'Failed audit still has header-only CSV'
-    $failure = Run-Cli @('-ReleasePath', (Join-Path $fixtures 'Clean'), '-MasterPath', 'sql\absent.sql') 'missing-master'
+    $failure = Run-Cli @('-HotfixPath', (Join-Path $fixtures 'Clean'), '-MasterPath', 'sql\absent.sql') 'missing-master'
     Assert-Equal $failure.ExitCode 2 'Missing master produces incomplete reports'
     $failureSummary = Get-Content -Raw -LiteralPath $failure.SummaryPath
     Assert-True ($failureSummary -match 'COULD NOT CHECK' -and $failureSummary -match 'Selected master does not exist' -and $failureSummary -notmatch 'Result: YES') 'Simple failure summary explains why coverage is unavailable'
     $lock = New-Object IO.FileStream($lockedMaster, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)
     try {
-        $lockedRun = Run-Cli @('-ReleasePath', $lockedRoot, '-MasterPath', 'sql\master.sql') 'locked-summary'
+        $lockedRun = Run-Cli @('-HotfixPath', $lockedRoot, '-MasterPath', 'sql\master.sql') 'locked-summary'
         $lockedSummary = Get-Content -Raw -LiteralPath $lockedRun.SummaryPath
         Assert-Equal $lockedRun.ExitCode 2 'Locked master preserves incomplete exit in simple mode'
         Assert-True ($lockedSummary -match 'COULD NOT CHECK' -and $lockedSummary -notmatch 'Files with no matching call: 0|Result: YES') 'Unreadable master never produces a misleading coverage summary'
     } finally { $lock.Dispose() }
-    $outsideMaster = Run-Cli @('-ReleasePath', (Join-Path $fixtures 'Clean'), '-MasterPath', (Join-Path $fixtures 'Release one\sql\master.sql')) 'outside-master'
-    Assert-Equal $outsideMaster.ExitCode 2 'Manual/batch master must remain within its release'
+    $outsideMaster = Run-Cli @('-HotfixPath', (Join-Path $fixtures 'Clean'), '-MasterPath', (Join-Path $fixtures 'Hotfix one\sql\master.sql')) 'outside-master'
+    Assert-Equal $outsideMaster.ExitCode 2 'Manual/batch master must remain within its hotfix'
 
     $badReport = Join-Path $fixtures 'Clean\must-not-create-reports'
-    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $checker -ReleasePath (Join-Path $fixtures 'Clean') -MasterPath 'sql\master.sql' -ReportDirectory $badReport > (Join-Path $work 'bad-report.log') 2>&1
-    Assert-Equal $LASTEXITCODE 2 'Reports inside release refused'
-    Assert-True (-not (Test-Path -LiteralPath $badReport)) 'Report guard runs before any release write'
-    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $checker -ReleasePath (Split-Path -Parent $checker) -MasterPath 'tests\fixtures\Clean\sql\master.sql' > (Join-Path $work 'utility-inside.log') 2>&1
-    Assert-Equal $LASTEXITCODE 2 'Utility inside scanned release refused'
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $checker -HotfixPath (Join-Path $fixtures 'Clean') -MasterPath 'sql\master.sql' -ReportDirectory $badReport > (Join-Path $work 'bad-report.log') 2>&1
+    Assert-Equal $LASTEXITCODE 2 'Reports inside hotfix refused'
+    Assert-True (-not (Test-Path -LiteralPath $badReport)) 'Report guard runs before any hotfix write'
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $checker -HotfixPath (Split-Path -Parent $checker) -MasterPath 'tests\fixtures\Clean\sql\master.sql' > (Join-Path $work 'utility-inside.log') 2>&1
+    Assert-Equal $LASTEXITCODE 2 'Utility inside scanned hotfix refused'
     $reportLink = Join-Path $work 'report-link'
     [void](New-Item -ItemType Junction -Path $reportLink -Value (Join-Path $fixtures 'Clean'))
-    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $checker -ReleasePath (Join-Path $fixtures 'Clean') -MasterPath 'sql\master.sql' -ReportDirectory $reportLink > (Join-Path $work 'report-link.log') 2>&1
-    Assert-Equal $LASTEXITCODE 2 'Report junction cannot bypass outside-release rule'
-    # One malformed input must not prevent other release rows from being audited.
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $checker -HotfixPath (Join-Path $fixtures 'Clean') -MasterPath 'sql\master.sql' -ReportDirectory $reportLink > (Join-Path $work 'report-link.log') 2>&1
+    Assert-Equal $LASTEXITCODE 2 'Report junction cannot bypass outside-hotfix rule'
+    # One malformed input must not prevent other hotfix rows from being audited.
     @(
-        [pscustomobject]@{ ReleasePath = 'C:relative'; MasterPath = 'sql\master.sql' },
-        [pscustomobject]@{ ReleasePath = (Join-Path $fixtures 'Clean'); MasterPath = 'sql\master.sql' }
+        [pscustomobject]@{ HotfixPath = 'C:relative'; MasterPath = 'sql\master.sql' },
+        [pscustomobject]@{ HotfixPath = (Join-Path $fixtures 'Clean'); MasterPath = 'sql\master.sql' }
     ) | Export-Csv -LiteralPath $inputFile -NoTypeInformation -Encoding UTF8
     $badInput = Run-Cli @('-InputCsv', $inputFile, '-DetailedReport') 'bad-input'
-    Assert-Equal $badInput.ExitCode 2 'Malformed release path recorded as failure'
-    Assert-Equal @(Import-Csv -LiteralPath (Join-Path $badInput.Folder '02_Clean_files.csv')).Count 1 'Valid release after malformed path is still audited'
+    Assert-Equal $badInput.ExitCode 2 'Malformed hotfix path recorded as failure'
+    Assert-Equal @(Import-Csv -LiteralPath (Join-Path $badInput.Folder '02_Clean_files.csv')).Count 1 'Valid hotfix after malformed path is still audited'
 
-    $interactiveRoot = New-TestRelease 'Interactive one' '@payload.pb' @{
+    $interactiveRoot = New-TestHotfix 'Interactive one' '@payload.pb' @{
         'sql\01-decoy.sql' = 'select 1 from dual;'; 'sql\payload.pb' = 'select 2 from dual;'
     }
-    $manualRoot = New-TestRelease 'Interactive two' 'select 1 from dual;' @{
+    $manualRoot = New-TestHotfix 'Interactive two' 'select 1 from dual;' @{
         'manual\chosen.sql' = '@@leaf.sql'; 'manual\leaf.sql' = 'select 2 from dual;'
     }
     $interactive = Run-Interactive $checker @($gone, $interactiveRoot, $interactiveRoot, ($interactiveRoot + '\'), $manualRoot, '', '99', '2', 'M', $lockedMaster, 'M', 'manual\chosen.sql') 'interactive'
-    Assert-Equal $interactive.ExitCode 1 'Interactive multiple-release workflow completes with findings'
-    Assert-True ($interactive.Output -match 'Invalid release:' -and $interactive.Output -match 'Invalid master:') 'Interactive validation re-prompts for bad input'
+    Assert-Equal $interactive.ExitCode 1 'Interactive multiple-hotfix workflow completes with findings'
+    Assert-True ($interactive.Output -match 'Invalid hotfix:' -and $interactive.Output -match 'Invalid master:') 'Interactive validation re-prompts for bad input'
     Assert-True ($interactive.Output -match [regex]::Escape('Selected master: ' + (Join-Path $interactiveRoot 'sql\master.sql'))) 'Master selected by number, not default first SQL file'
-    Assert-True ($interactive.Output -match [regex]::Escape('Selected master: ' + (Join-Path $manualRoot 'manual\chosen.sql'))) 'Manual selection outside sql directory accepted within release'
-    Assert-True ($interactive.Output -match 'Releases checked: 2' -and $interactive.Output -notmatch 'COULD NOT CHECK|Some content or calls could not be checked') 'Interactive releases have separate completed summaries'
-    Assert-True ($interactive.Output -match [regex]::Escape('Added release: ' + $interactiveRoot)) 'Accepted folder is visibly acknowledged'
+    Assert-True ($interactive.Output -match [regex]::Escape('Selected master: ' + (Join-Path $manualRoot 'manual\chosen.sql'))) 'Manual selection outside sql directory accepted within hotfix'
+    Assert-True ($interactive.Output -match 'Hotfixes checked: 2' -and $interactive.Output -notmatch 'COULD NOT CHECK|Some content or calls could not be checked') 'Interactive hotfixes have separate completed summaries'
+    Assert-True ($interactive.Output -match [regex]::Escape('Added hotfix: ' + $interactiveRoot)) 'Accepted folder is visibly acknowledged'
     Assert-Equal @([regex]::Matches($interactive.Output, 'Already added:')).Count 2 'Duplicate entries are acknowledged and not added twice'
     # ConsoleHost does not emit Read-Host prompt text when stdin is redirected.
     Assert-True ($interactive.Output -match 'Press Enter on the empty prompt to continue to master selection') 'Accepted and duplicate inputs explain how to advance'
-    Assert-True ($interactive.Output -match 'Releases selected: Next, confirm or select a master for each release\.') 'Blank input advances to master selection using the requested prompt'
-    $autoRoot = New-TestRelease 'Auto master hotfix' '-- Decoy master, not the detected master.' @{
+    Assert-True ($interactive.Output -match 'Hotfixes selected: Next, confirm or select a master for each hotfix\.') 'Blank input advances to master selection using the requested prompt'
+    $autoRoot = New-TestHotfix 'Auto master hotfix' '-- Decoy master, not the detected master.' @{
         'sql\AUTO MASTER HOTFIX.SQL' = '@payload.pb';
         'sql\payload.pb' = 'select 1 from dual;';
         'manual\chosen.sql' = '@@leaf.sql'; 'manual\leaf.sql' = 'select 2 from dual;'
@@ -1196,11 +1196,11 @@ start support.txt
     $rejectedAuto = Run-Interactive $checker @($autoRoot, '', 'n', 'M', 'manual\chosen.sql') 'auto-reject'
     Assert-Equal $rejectedAuto.ExitCode 1 'Manual choice after N preserves coverage result'
     Assert-True ($rejectedAuto.Output -match 'Select the master for:' -and $rejectedAuto.Output -match [regex]::Escape('Selected master: ' + (Join-Path $autoRoot 'manual\chosen.sql'))) 'N opens the menu and honors a manually entered master'
-    Assert-True ($interactive.Output -match 'No master matching the release folder name was found') 'Missing folder-name master falls back to the existing menu'
+    Assert-True ($interactive.Output -match 'No master matching the hotfix folder name was found') 'Missing folder-name master falls back to the existing menu'
     $launchCopy = Join-Path $work 'Double click utility'
     [void](New-Item -ItemType Directory -Path $launchCopy)
     Copy-Item -LiteralPath $checker, $launcher -Destination $launchCopy
-    $paused = Run-Interactive (Join-Path $launchCopy 'Check-Release.bat') @((Join-Path $fixtures 'Clean'), '', '2', 'x') 'double-click' $true
+    $paused = Run-Interactive (Join-Path $launchCopy 'Hotfix-Checker.bat') @((Join-Path $fixtures 'Clean'), '', '2', 'x') 'double-click' $true
     Assert-Equal $paused.ExitCode 0 'No-argument BAT run completes and preserves result'
     Assert-True ($paused.Output -match 'Press any key to continue') 'Double-click launcher displays pause prompt'
     Assert-True ($paused.Output -notmatch 'Press Enter to close this window') 'BAT owns its pause without a second script pause'
@@ -1211,7 +1211,7 @@ start support.txt
     for ($menuIndex = 1; $menuIndex -le 19; $menuIndex++) {
         $menu20Files[('sql\00-{0:D2}.sql' -f $menuIndex)] = '-- Other SQL file, not the selected master.'
     }
-    $menu20Root = New-TestRelease 'Menu twenty' "SET DEFINE ON`nstart payload.pb" $menu20Files
+    $menu20Root = New-TestHotfix 'Menu twenty' "SET DEFINE ON`nstart payload.pb" $menu20Files
     $selection20 = Run-Interactive $checker @($menu20Root, '', '20') 'selection20' -VerifyKeepOpen
     Assert-True $selection20.HeldForClose 'Direct PowerShell launch stays alive after selecting master 20'
     Assert-Equal $selection20.ExitCode 1 'Selecting master 20 completes and preserves findings status'
@@ -1226,7 +1226,7 @@ start support.txt
     Assert-True ($noWait.Output -notmatch 'Press Enter to close this window') 'Explicit NoPause disables the final script wait'
 
     $mixedName = 'ni' + [char]0x00F1 + 'o.pb'
-    $retryRoot = New-TestRelease 'Retry hotfix' 'placeholder' @{
+    $retryRoot = New-TestHotfix 'Retry hotfix' 'placeholder' @{
         ('sql\' + $ansiName) = 'select 1 from dual;'; 'sql\child.sql' = ('@' + $mixedName)
         ('sql\' + $mixedName) = 'select 2 from dual;'
     }
@@ -1248,17 +1248,17 @@ start support.txt
     $retryDetailed = Run-Interactive $checker @($retryRoot, '', 'Y') 'retry-mixed-details' -Nested -Detailed
     Assert-Equal $retryDetailed.ExitCode 1 'Mixed-encoding detailed audit completes with the same coverage status'
     $retryFilesCsv = @(Get-ChildItem -LiteralPath (Join-Path $work 'retry-mixed-details-reports') -Filter '*_files.csv' -File -Recurse)
-    Assert-Equal $retryFilesCsv.Count 1 'Detailed retry writes exactly one release files CSV'
+    Assert-Equal $retryFilesCsv.Count 1 'Detailed retry writes exactly one hotfix files CSV'
     $retryMixedRow = @(Import-Csv -LiteralPath $retryFilesCsv[0].FullName | Where-Object { $_.RelativeFilePath -ceq ('sql\' + $mixedName) })
     Assert-Equal $retryMixedRow.Count 1 'UTF-8 child target retains its exact accented filename'
     Assert-Equal $retryMixedRow[0].IndirectCallCount 1 'Retrying the ANSI master leaves the UTF-8 child decoder unchanged'
     $retryStrict = Run-Interactive $checker @($retryRoot, '', 'Y') 'strict-encoding' -VerifyKeepOpen -StrictUtf8
     Assert-Equal $retryStrict.ExitCode 2 'Explicit UTF8 keeps invalid legacy bytes incomplete'
     Assert-True ($retryStrict.Output -match 'COULD NOT CHECK' -and $retryStrict.Output -notmatch '(?m)^Encoding fallback:|Retry this file') 'Explicit strict decoding never silently changes encoding or asks for a retry'
-    $retryDoubleClick = Run-Interactive (Join-Path $launchCopy 'Check-Release.bat') @($retryRoot, '', 'Y', 'x') 'retry-double-click' $true
+    $retryDoubleClick = Run-Interactive (Join-Path $launchCopy 'Hotfix-Checker.bat') @($retryRoot, '', 'Y', 'x') 'retry-double-click' $true
     Assert-Equal $retryDoubleClick.ExitCode 1 'Double-click BAT supports an encoding retry without extra arguments'
     Assert-True ($retryDoubleClick.Output -match 'Files called by master: 2' -and $retryDoubleClick.Output -match 'Press any key to continue') 'Double-click retry finishes coverage and retains its pause'
-    $badBomRoot = New-TestRelease 'Retry invalid BOM' 'placeholder' @{}
+    $badBomRoot = New-TestHotfix 'Retry invalid BOM' 'placeholder' @{}
     $badBomMaster = Join-Path $badBomRoot 'sql\Retry invalid BOM.sql'
     Move-Item -LiteralPath (Join-Path $badBomRoot 'sql\master.sql') -Destination $badBomMaster
     [IO.File]::WriteAllBytes($badBomMaster, [byte[]]@(239, 187, 191, 160))
@@ -1268,7 +1268,7 @@ start support.txt
 
     Write-Host 'Checking malicious data, path aliases, and report write protections.'
     $sharpName = 'stra' + [char]0x00DF + 'e.sql'
-    $unicodeRoot = New-TestRelease 'Unicode files' 'START strasse.sql' @{ ('sql\' + $sharpName) = '-- A different filename.' }
+    $unicodeRoot = New-TestHotfix 'Unicode files' 'START strasse.sql' @{ ('sql\' + $sharpName) = '-- A different filename.' }
     Assert-Equal (Row (Audit-Path $unicodeRoot) ('sql\' + $sharpName)).DirectCallCount 0 'Unicode linguistic equivalence cannot satisfy a different filename'
     Set-Content -LiteralPath (Join-Path $unicodeRoot 'sql\strasse.sql') -Value 'select 1 from dual;' -Encoding UTF8
     $unicodeAudit = Audit-Path $unicodeRoot
@@ -1295,14 +1295,14 @@ start support.txt
         Assert-Equal @($csvValues[$cellIndex].PSObject.Properties).Count 1 'Quote/separator payload cannot create extra CSV columns'
     }
     $escapeText = 'HOST echo ' + [char]27 + '[2J' + [char]0x202E + 'spoof'
-    $escapeRoot = New-TestRelease 'Terminal escape' $escapeText @{ 'sql\unused.pb' = 'select 1 from dual;' }
-    $escapedRun = Run-Cli @('-ReleasePath', $escapeRoot, '-MasterPath', 'sql\master.sql', '-DetailedReport') 'terminal-controls'
+    $escapeRoot = New-TestHotfix 'Terminal escape' $escapeText @{ 'sql\unused.pb' = 'select 1 from dual;' }
+    $escapedRun = Run-Cli @('-HotfixPath', $escapeRoot, '-MasterPath', 'sql\master.sql', '-DetailedReport') 'terminal-controls'
     $escapedLog = Get-Content -Raw -LiteralPath $escapedRun.Log
     $escapedTxt = Get-Content -Raw -LiteralPath $escapedRun.SummaryPath
     Assert-True ($escapedLog.IndexOf([char]27) -lt 0 -and $escapedTxt.IndexOf([char]0x202E) -lt 0) 'CMD and TXT cannot execute terminal escapes or hide text direction'
     Assert-True ($escapedTxt.Contains('\u001B') -and $escapedTxt.Contains('\u202E')) 'Unsafe controls remain visible as escaped evidence'
     $noExecuteMarker = Join-Path $work 'must-not-execute.txt'
-    $noExecuteRoot = New-TestRelease 'Never execute' ('HOST echo bad > "' + $noExecuteMarker + '"') @{}
+    $noExecuteRoot = New-TestHotfix 'Never execute' ('HOST echo bad > "' + $noExecuteMarker + '"') @{}
     [void](Audit-Path $noExecuteRoot)
     Assert-True (-not (Test-Path -LiteralPath $noExecuteMarker)) 'HOST source text cannot create files or execute commands'
 
@@ -1320,18 +1320,32 @@ start support.txt
     Assert-True $writeRejected 'Report writer refuses a hardlink to an existing file'
     Assert-Equal (Get-FileHash -LiteralPath $protectedOutput -Algorithm SHA256).Hash $protectedHash 'Hardlink target cannot be overwritten by report creation'
 
-    $shortRoot = Join-Path $fixtures 'RELEAS~1'
-    if (Test-Path -LiteralPath $shortRoot -PathType Container) {
+    # Query the actual alias: renaming fixtures can change their 8.3 names.
+    if (-not ('HotfixCheckerTestPaths' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System.Text;
+using System.Runtime.InteropServices;
+public static class HotfixCheckerTestPaths {
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    public static extern uint GetShortPathName(string longPath, StringBuilder shortPath, uint capacity);
+}
+'@
+    }
+    $longRoot = Join-Path $fixtures 'Hotfix one'
+    $shortBuffer = [Text.StringBuilder]::new(32768)
+    $shortLength = [HotfixCheckerTestPaths]::GetShortPathName($longRoot, $shortBuffer, [uint32]$shortBuffer.Capacity)
+    $shortRoot = if ($shortLength -gt 0 -and $shortLength -lt $shortBuffer.Capacity) { $shortBuffer.ToString() } else { '' }
+    if ($shortRoot -and -not (Test-SamePath $shortRoot $longRoot) -and (Test-Path -LiteralPath $shortRoot -PathType Container)) {
         $savedReportAudits = $script:ReportAudits
         try {
-            $script:ReportAudits = @((Audit-Fixture 'Release one'))
+            $script:ReportAudits = @((Audit-Fixture 'Hotfix one'))
             $aliasDestination = Join-Path $shortRoot 'must-not-create-alias-reports'
             $aliasRejected = $false
-            try { Assert-ReportLocation $aliasDestination } catch { $aliasRejected = $_.Exception.Message -match 'outside ALL scanned releases' }
-            Assert-True $aliasRejected 'Physical report guard catches a Windows 8.3 release alias'
-            Assert-True (-not (Test-Path -LiteralPath $aliasDestination)) 'Short-name guard writes nothing to the release'
+            try { Assert-ReportLocation $aliasDestination } catch { $aliasRejected = $_.Exception.Message -match 'outside ALL scanned hotfixes' }
+            Assert-True $aliasRejected 'Physical report guard catches a Windows 8.3 hotfix alias'
+            Assert-True (-not (Test-Path -LiteralPath $aliasDestination)) 'Short-name guard writes nothing to the hotfix'
         } finally { $script:ReportAudits = $savedReportAudits }
-    }
+    } else { Write-Host 'SKIP: Windows did not provide a distinct short-name alias for the hotfix fixture.' }
     foreach ($invalidPath in @('\\.\NUL', '\\?\C:\probe', (Join-Path $work 'master.sql:secret.sql'), (Join-Path $work 'NUL.sql'),
         (Join-Path $work 'CON.txt'), (Join-Path $work 'COM1.sql'), (Join-Path $work 'CONIN$'), (Join-Path $work 'CONOUT$'),
         (Join-Path $work ('bad' + [char]27 + 'name')))) {
@@ -1348,16 +1362,16 @@ start support.txt
     Assert-Equal @([regex]::Matches($spoofSummary, '(?m)^Result:')).Count 1 'Malformed CSV input cannot inject a second result into a detailed summary'
     Assert-True ($spoofSummary.Contains('\u000AResult:') -and $spoofSummary.Contains('\u000AWorking spoof')) 'Invalid input line breaks remain visible as evidence'
 
-    $largeRoot = New-TestRelease 'Large script' 'placeholder' @{ 'sql\payload.pb' = 'select 1 from dual;' }
+    $largeRoot = New-TestHotfix 'Large script' 'placeholder' @{ 'sql\payload.pb' = 'select 1 from dual;' }
     [IO.File]::WriteAllText((Join-Path $largeRoot 'sql\master.sql'), "@payload.pb`n--" + [string]::new('a', 1MB), [Text.UTF8Encoding]::new($false))
-    $limitedRun = Run-Cli @('-ReleasePath', $largeRoot, '-MasterPath', 'sql\master.sql', '-MaxScriptSizeMB', '1') 'large-limited'
+    $limitedRun = Run-Cli @('-HotfixPath', $largeRoot, '-MasterPath', 'sql\master.sql', '-MaxScriptSizeMB', '1') 'large-limited'
     Assert-Equal $limitedRun.ExitCode 2 'Oversized input produces an incomplete check instead of unbounded allocation'
     $limitedSummary = Get-Content -Raw -LiteralPath $limitedRun.SummaryPath
     Assert-True ($limitedSummary -match 'COULD NOT CHECK' -and $limitedSummary -match 'exceeds the 1 MB read limit') 'Size limit explains why coverage is unavailable'
-    $largerLimitRun = Run-Cli @('-ReleasePath', $largeRoot, '-MasterPath', 'sql\master.sql', '-MaxScriptSizeMB', '2') 'large-allowed'
+    $largerLimitRun = Run-Cli @('-HotfixPath', $largeRoot, '-MasterPath', 'sql\master.sql', '-MaxScriptSizeMB', '2') 'large-allowed'
     Assert-Equal $largerLimitRun.ExitCode 0 'Increasing the explicit size limit preserves legitimate larger scripts'
     foreach ($bomPage in @(65001, 1200, 1201, 12000, 12001)) {
-        $bomRoot = New-TestRelease ('BOM-' + $bomPage) 'placeholder' @{ 'sql\payload.pb' = 'select 1 from dual;' }
+        $bomRoot = New-TestHotfix ('BOM-' + $bomPage) 'placeholder' @{ 'sql\payload.pb' = 'select 1 from dual;' }
         $bomEncoding = [Text.Encoding]::GetEncoding($bomPage)
         [IO.File]::WriteAllBytes((Join-Path $bomRoot 'sql\master.sql'), ($bomEncoding.GetPreamble() + $bomEncoding.GetBytes('@payload.pb')))
         Assert-Equal (Audit-Path $bomRoot).ExitCode 0 'Strict decoding recognizes every supported Unicode BOM'

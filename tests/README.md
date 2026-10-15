@@ -2,22 +2,22 @@
 
 Run `powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\Test-Checker.ps1`
 from the utility folder. Tests need Windows PowerShell 5.1, but no Pester or external
-dependencies. They retain generated cases and reports outside fixture releases in
+dependencies. They retain generated cases and reports outside fixture hotfixes in
 `tests\.work`. Do not execute any fixture scripts yourself.
 
 | Fixture | Mode | Discovered | Excluded | Eligible | Direct | Not direct | Indirect only | Exit |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Release one | Direct | 36 | 8 | 27 | 16 | 11 | Not checked | 2 |
-| Release one | Nested | 36 | 8 | 27 | 16 | 11 | 1 | 2 |
-| Release two | Direct | 2 | 1 | 0 | 0 | 0 | Not checked | 1 |
+| Hotfix one | Direct | 36 | 8 | 27 | 16 | 11 | Not checked | 2 |
+| Hotfix one | Nested | 36 | 8 | 27 | 16 | 11 | 1 | 2 |
+| Hotfix two | Direct | 2 | 1 | 0 | 0 | 0 | Not checked | 1 |
 | Clean | Either | 2 | 0 | 1 | 1 | 0 | 0 if nested | 0 |
 | Settings | Direct | 4 | 0 | 3 | 2 | 1 | Not checked | 1 |
 | Settings | Nested | 4 | 0 | 3 | 1 | 2 | 0 | 2 |
 
-`expected-release-one.csv` specifies the exact eligible file rows, direct status,
-nested status, matching method, and counts. Release one's two missing calls are
+`expected-hotfix-one.csv` specifies the exact eligible file rows, direct status,
+nested status, matching method, and counts. Hotfix one's two missing calls are
 `wrong\py_post.pb` and `missing.sql`; `dup.pb` covers both exact-name copies;
-`&release_script` is unresolved. `py_post.pb` and `same.sql` each have two direct
+`&hotfix_script` is unresolved. `py_post.pb` and `same.sql` each have two direct
 call sites. Nested mode adds two indirect call sites for `indirect.sql`, one cycle
 back to the master, and a fourth repeated target. There are 22 direct file-match
 records and 25 records with nesting. Multiple copies are separate matches to
@@ -25,7 +25,7 @@ the same source line; they do not imply execution of every copy. Commented,
 output-only, SQL literal-only,
 substring lookalikes, and unrelated scripts never contribute coverage.
 
-Release two must not match `py_post.pb` from Release one. In Settings, nested
+Hotfix two must not match `py_post.pb` from Hotfix one. In Settings, nested
 `SET SUFFIX` makes the extensionless master call unresolved and prevents guessing
 between `.sql` and `.pb`. Direct-only mode does not inspect the child and uses its
 documented default suffix assumption.
@@ -88,7 +88,7 @@ update correctly. Escaped quote/interpolation characters must round-trip and
 already matching values remain unchanged. A competing read handle must block
 replacement, preserve the original bytes, remove the staging file, and allow a
 successful retry after closing. Differently cased input paths must retain the
-stored release-folder spelling in installer values and renamed files.
+stored hotfix-folder spelling in installer values and renamed files.
 Quote operators with word or next-line delimiters are also rejected. A separate
 fault-injection case simulates replacement failing after the original is moved:
 both the byte-identical original backup and the complete prepared replacement
@@ -123,7 +123,7 @@ claim. Original file hashes must remain unchanged by this check.
 
 Documentation cases include the usual pair of DOCX files: the installation
 instructions must retain their name, bytes and modification time while the
-other document is renamed. Tests also cover case-only renames, older release
+other document is renamed. Tests also cover case-only renames, older hotfix
 numbers, already matching names, Office lock files, nested documents, multiple
 candidates, destination directories, and junctions. Empty renamed DOCX files
 must appear in zero-byte output under their final name. Real CMD and detailed
@@ -135,6 +135,9 @@ controls, invalid-input result-line spoofing, report overwrite/hardlink preventi
 short-name report destinations, reserved devices before/after path normalization
 and alternate streams, explicit size limits, and all five
 supported Unicode BOMs. Fixture paths and hashes must remain unchanged.
+The short-name boundary test queries Windows for the fixture's actual alias;
+it does not assume an alias derived from the directory's old name. Filesystems
+without a distinct short alias report that case as skipped.
 
 Mapped-drive regressions verify that ordinary file/directory entries never
 evaluate lazy LinkType/Target getters, while junction and cloud-placeholder
@@ -165,5 +168,5 @@ SQL, UPDATE literals, alternate literals, and comments must never count; active
 calls after these constructs must remain visible. Genuine unclosed literals or
 comments report their opening line and source. SQL*Plus control/prompt text with
 apostrophes cannot consume later calls. Exact duplicate basenames cover all
-release copies for bare master START/@ calls; explicit paths, @@ paths, substring
+hotfix copies for bare master START/@ calls; explicit paths, @@ paths, substring
 lookalikes, and nested path selection retain their separate expectations.

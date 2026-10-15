@@ -1,10 +1,13 @@
-# Release Script Checker security review
+# Hotfix Checker security review
 
 Reviewed October 15, 2026, on Windows PowerShell 5.1.19041.7802.
-Scope: `Check-Release.ps1`, the CMD launcher, report generation, permitted
+Scope: `Hotfix-Checker.ps1`, the CMD launcher, report generation, permitted
 hotfix changes, the regression harness/fixtures, and the distributable ZIP.
+The utility, documentation, prompts, input/output schemas and test fixtures use
+Hotfix Checker naming. Validation runs the renamed BAT/PowerShell pair with
+`HotfixPath` inputs, `HotfixRoot` output columns and the updated status names.
 This replaces the October 12 review, whose GUID report names and read-only
-release behavior no longer described the current utility.
+hotfix behavior no longer described the current utility.
 
 This was a local source review and regression assessment. No critical or
 high-severity issue was identified in the reviewed code. This is not a security
@@ -36,8 +39,8 @@ them. Ordinary code after the last potential assignment does not block editing.
 
 ## Controls verified
 
-- **Release content stays data.** No SQL, Perl, shell commands, substitution
-  variables, or expressions from a release are executed. Unsupported/dynamic
+- **Hotfix content stays data.** No SQL, Perl, shell commands, substitution
+  variables, or expressions from a hotfix are executed. Unsupported/dynamic
   calls remain unresolved instead of being evaluated. Add-Type compiles only
   fixed application-owned C# for Windows path metadata.
 - **Bounded reads and conservative analysis.** Script bytes are size-checked
@@ -47,10 +50,10 @@ them. Ordinary code after the last potential assignment does not block editing.
   fallback. Nested traversal stops at cycles and depth 128. Unknown settings or
   incomplete parsing produce exit 2 instead of an unqualified clean result.
 - **Filesystem boundaries.** Reports and the utility must stay outside every
-  release, with physical Windows path checks covering short-name aliases.
+  hotfix, with physical Windows path checks covering short-name aliases.
   Paths reject device namespaces/reserved names, alternate data streams,
   drive-relative forms and controls. Junction/symbolic-link paths are rejected
-  for mutations and reports; linked release entries are not followed for
+  for mutations and reports; linked hotfix entries are not followed for
   coverage. OneDrive placeholders retain their existing supported behavior.
 - **Write protection.** New reports use exclusive CreateNew, refuse overwrite
   and existing hardlinks, and recheck locations before writing. Named report
@@ -63,8 +66,8 @@ them. Ordinary code after the last potential assignment does not block editing.
   Structured fields cannot inject extra summary result lines. Detailed reports
   can contain source text/arguments and inherit the report directory's access
   controls; they are not automatically redacted.
-- **External targets.** Calls outside a release are recorded without reading or
-  fetching their targets. Explicitly supplied UNC release/report locations
+- **External targets.** Calls outside a hotfix are recorded without reading or
+  fetching their targets. Explicitly supplied UNC hotfix/report locations
   still use Windows network filesystem access with the current user's rights.
   The CMD launcher starts the installed Windows PowerShell with NoProfile and a
   process-local execution-policy argument; it does not change machine policy.
@@ -108,7 +111,7 @@ reviewed manually.
 
 The distributable ZIP is rebuilt from the source/docs/tests/fixtures. Every entry
 is compared with its source by SHA-256 before publishing the archive. Generated
-reports, test scratch data, and actual releases are excluded.
+reports, test scratch data, and actual hotfixes are excluded.
 
 ## Remaining limits
 
@@ -124,7 +127,7 @@ reports, test scratch data, and actual releases are excluded.
   Unsupported replacement fails explicitly. Tests cover ordinary local success
   and sharing/read-only failures, not power loss, disk exhaustion, every network
   server, or all filesystem drivers. Replacement errors and interrupted
-  processes can leave inert `.release-checker-*.tmp`/`.bak` siblings. Errors
+  processes can leave inert `.hotfix-checker-*.tmp`/`.bak` siblings. Errors
   identify recovery paths; no automatic recovery from interrupted execution or
   disk-durability guarantee is claimed.
 - Per-script/depth limits do not set a total CPU/memory/inventory budget. Large

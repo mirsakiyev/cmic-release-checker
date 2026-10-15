@@ -29,7 +29,7 @@ start dup.pb
 @same.sql;
 @wrong\py_post.pb
 @missing.sql
-@&release_script
+@&hotfix_script
 /* leading comment */ start MiXeD.PKS
 @nested.sql
 @same.sql

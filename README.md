@@ -1,21 +1,22 @@
-# Release Script Checker
+# Hotfix Checker
 
-Checks which files in a release folder are directly called by a selected SQL
+Checks which files in a hotfix folder are directly called by a selected SQL
 master, then checks whether the files called by that master are present in the
 hotfix folder. It also synchronizes the installer's `my $hotfix` value with the
-release folder name and renames the five supported Perl/undeploy scripts inside
+hotfix folder name and renames the five supported Perl/undeploy scripts inside
 `sql` to match that name. It also checks for zero-byte files and renames the
 hotfix DOCX in `documentation`, preserving the installation instructions.
-It never executes release scripts.
+It never executes hotfix scripts.
 
 ## Use
 
-Keep `Check-Release.bat` and `Check-Release.ps1` together outside your releases.
-Double-click **Check-Release.bat**:
+Extract `Hotfix-Checker.zip` to the folder where you want to keep the utility.
+Keep `Hotfix-Checker.bat` and `Hotfix-Checker.ps1` together outside your hotfixes.
+Double-click **Hotfix-Checker.bat**:
 
-1. Enter a release folder. Press Enter at the next empty prompt to continue.
-   You can also enter more release folders before the blank line.
-2. The checker detects `sql\<release folder name>.sql` and asks whether it is the
+1. Enter a hotfix folder. Press Enter at the next empty prompt to continue.
+   You can also enter more hotfix folders before the blank line.
+2. The checker detects `sql\<hotfix folder name>.sql` and asks whether it is the
    master for this hotfix. Enter `Y` to use it. Enter `N` to choose another master
    by number or use `M` to enter its path. If no matching file exists, the manual
    selection menu appears automatically. Names are matched ignoring case.
@@ -38,7 +39,7 @@ reports\20261015_1215PM_V12-020-2-02N-HF-AMI-16\summary_V12-020-2-02N-HF-AMI-16.
 ```
 
 `DATE` is `yyyyMMdd`; `TIME` is `hhmmAM`/`hhmmPM` using the current time in
-America/Toronto, including daylight saving time. `HOTFIX` is the selected release
+America/Toronto, including daylight saving time. `HOTFIX` is the selected hotfix
 folder name. Each selected hotfix gets its own folder and summary, including
 multi-hotfix runs. If the folder already exists, `_2`, `_3`, and so on are added
 to the folder name to preserve earlier reports. The window stays open so you can
@@ -49,7 +50,7 @@ asterisk boxes in CMD and in the saved TXT file. The same section styling is
 also used in detailed reports and their combined-total header.
 
 Every summary places `Executed by: <current Windows username>` below its title
-box and before the release path. The username is detected automatically from the account running
+box and before the hotfix path. The username is detected automatically from the account running
 the script and is included in normal, detailed, and combined summaries.
 
 While checking, the console shows validation, folder scanning, master reading,
@@ -60,10 +61,10 @@ Example summary:
 
 ```text
 ***********************************************************************************
-*  Release Script Checker                                                         *
+*  Hotfix Checker                                                                 *
 ***********************************************************************************
 Executed by: Aslan.Mirsakiyev
-Release: C:\Aslan\TEMP\V12-023-2-02-HF-AMA-21
+Hotfix: C:\Aslan\TEMP\V12-023-2-02-HF-AMA-21
 Selected master: C:\Aslan\TEMP\V12-023-2-02-HF-AMA-21\sql\V12-023-2-02-HF-AMA-21.sql
 Result: NO - 2 file(s) have no matching call in the master.
 Files checked: 5
@@ -98,11 +99,11 @@ Required files missing from hotfix folder (master line numbers)
 ## From CMD
 
 ```bat
-Check-Release.bat -ReleasePath "D:\testing\V12-024-2-02-HF-ALC-03" -MasterPath "sql\V12-024-2-02-HF-ALC-03.sql" -NonInteractive
+Hotfix-Checker.bat -HotfixPath "D:\testing\V12-024-2-02-HF-ALC-03" -MasterPath "sql\V12-024-2-02-HF-ALC-03.sql" -NonInteractive
 ```
 
-Use `-ReportDirectory "C:\ReleaseAudits"` to change where the summary is saved.
-Reports must be outside every selected release. Existing reports are preserved.
+Use `-ReportDirectory "C:\HotfixAudits"` to change where the summary is saved.
+Reports must be outside every selected hotfix. Existing reports are preserved.
 Windows PowerShell 5.1 is required; no additional tools or modules are needed.
 
 ## What counts as called
@@ -111,11 +112,11 @@ Windows PowerShell 5.1 is required; no additional tools or modules are needed.
   count. Comments, quoted SQL literals, and output commands do not count.
 - Names match case-insensitively as whole filenames/paths, including quoted paths
   with spaces. A bare `START`/`@` filename in the master covers every exact-name
-  copy across release folders: `START aperror.dat` covers both `sql\aperror.dat`
+  copy across hotfix folders: `START aperror.dat` covers both `sql\aperror.dat`
   and `uig\sql\aperror.dat`. The summary notes this filename-presence match;
   it does not establish which copy SQL*Plus executes. Extensionless calls assume
   `.sql`.
-- All release files are checked recursively except the selected master and files
+- All hotfix files are checked recursively except the selected master and files
   ending in `.ear`, `.java`, `.war`, `.bc`, `.zip`, `.docx`, `.wft`, `.perl`, `.pl`,
   `.txt`, `.cmd`, `.sh`, `.bat`, `.undeploy`, `.properties`, `.jar`, or `.deploy`. These exclusions ignore case.
 - Calls with explicit paths use exact path matching. `START`/`@` paths use the
@@ -144,7 +145,7 @@ Explicit paths must match their path within the hotfix; targets outside the
 hotfix also count as absent from it. External locations are never searched.
 
 The separate `$script:AllowedMissingCallTargets` list near the top of
-`Check-Release.ps1` contains all 93 supplied exception entries. Edit that list to
+`Hotfix-Checker.ps1` contains all 93 supplied exception entries. Edit that list to
 maintain the exceptions. It matches whole filenames ignoring case, including
 path-qualified calls. Extensionless calls such as `ptfcompx` assume `.sql`.
 The same exceptions apply to `START`, `@`, and `@@` master calls. A listed
@@ -175,9 +176,11 @@ a separate `DATE_TIME_Combined` folder. These details are optional; normal runs
 save only one summary TXT per hotfix. `-IncludeNested` inspects reachable scripts, but files called only
 indirectly still have no direct call in the master.
 
-For multiple releases from CMD, use `-InputCsv inputs.csv` with columns
-`ReleasePath,MasterPath,WorkingDirectory` (the last column is optional).
-PowerShell callers can pass paired arrays to `-ReleasePath` and `-MasterPath`.
+For multiple hotfixes from CMD, use `-InputCsv inputs.csv` with columns
+`HotfixPath,MasterPath,WorkingDirectory` (the last column is optional).
+PowerShell callers can pass paired arrays to `-HotfixPath` and `-MasterPath`.
+Detailed output CSVs identify the checked folder with the `HotfixRoot` column;
+missing/external targets use the `MissingInHotfix` and `OutsideHotfix` statuses.
 Use `-ScriptEncoding Default` for legacy Windows ANSI scripts using the laptop's
 active code page. Use `-ScriptEncoding Windows1252` when the source is known to
 use Western Windows-1252, regardless of the laptop's locale. The default
@@ -188,7 +191,7 @@ malformed BOM-declared Unicode remains an error.
 `-NoPause` disables the final wait when
 running the PowerShell script interactively. `-Help` lists parameters.
 
-If a mapped drive is slow, use `Check-Release.bat -Verbose` to show each folder
+If a mapped drive is slow, use `Hotfix-Checker.bat -Verbose` to show each folder
 being scanned and each script being read. The last message identifies the
 operation waiting on Windows or the server. Ordinary files are checked without
 querying PowerShell's extra link metadata; junctions and symbolic links still
@@ -197,15 +200,15 @@ for Windows network timeouts.
 
 ## Security and limits
 
-The checker treats release scripts as data. It never evaluates variables or runs
+The checker treats hotfix scripts as data. It never evaluates variables or runs
 their commands. Report locations are checked against Windows filesystem paths,
 including short-name aliases, and checked again before each write. Reports use
 fresh folders and refuse to overwrite existing files or hardlinks.
 
 Terminal controls and invisible direction markers are shown as `\uXXXX` escapes.
 Formula-like values in detailed CSVs receive a visible `text:` prefix; downstream
-CSV consumers must account for that prefix. Release SQL file contents remain
-unchanged. The only release changes are the installer assignment update and
+CSV consumers must account for that prefix. Hotfix SQL file contents remain
+unchanged. The only hotfix changes are the installer assignment update and
 the supported script and documentation filename changes described below.
 
 ## 0KB files
@@ -231,7 +234,7 @@ Office `~$` lock files and documents in subfolders are not rename candidates.
 
 The other DOCX is renamed to `HOTFIX.docx`. For example, inside
 `V12-023-2-02-HF-ALC-02\documentation`, an older hotfix document becomes
-`V12-023-2-02-HF-ALC-02.docx`. The old document can have a different release or
+`V12-023-2-02-HF-ALC-02.docx`. The old document can have a different hotfix or
 build number. The folder's exact casing and lowercase `.docx` are used.
 
 The rename preserves document contents and modification time. Already matching
@@ -256,8 +259,8 @@ for files beginning with `V12-` (ignoring case) and ending with one of these suf
 
 Each matching file is renamed to `HOTFIX` plus its suffix. For example,
 `v12-023-2-02-hf-ama-01.aftercopy.perl` becomes
-`V12-023-2-02-HF-AMA-21.aftercopy.perl` when the release folder is
-`V12-023-2-02-HF-AMA-21`. The hotfix name uses the release folder's casing, and
+`V12-023-2-02-HF-AMA-21.aftercopy.perl` when the hotfix folder is
+`V12-023-2-02-HF-AMA-21`. The hotfix name uses the hotfix folder's casing, and
 the suffixes use the lowercase spelling above. Case-only differences are fixed.
 
 File contents and modification times are preserved. Already matching names and
@@ -275,7 +278,7 @@ are not followed for renames.
 
 When a readable master is checked, the checker looks for
 `HOTFIX\v12hotfixinstall\v12hotfixinstall.pl`. If present, it updates only the
-value of the active literal assignment to match the release folder name:
+value of the active literal assignment to match the hotfix folder name:
 
 ```perl
 my $hotfix = "V12-020-2-02N-HF-AMI-16";
@@ -293,8 +296,8 @@ The original is retained in a temporary backup during replacement; both
 temporary files are removed after success. A failure before replacement removes
 the staged file. If replacement itself fails, recovery files are preserved and
 their paths are included in the failure summary. There is no fallback to an
-in-place write. An interrupted process may leave `.release-checker-*.tmp` or
-`.release-checker-*.bak` siblings, which are never executed.
+in-place write. An interrupted process may leave `.hotfix-checker-*.tmp` or
+`.hotfix-checker-*.bak` siblings, which are never executed.
 
 If the installer cannot be updated, or the checker cannot find exactly one
 literal `my $hotfix` assignment, the run reports the reason and exits with `2`.
@@ -319,7 +322,7 @@ This is a static check,
 not a full Perl parser. Only context through the last potential assignment
 needs inspection; ordinary code after it does not prevent an update.
 
-Installer values, renamed hook/DOCX files, and report names use the release
+Installer values, renamed hook/DOCX files, and report names use the hotfix
 folder's stored spelling, even if its input path uses different capitalization.
 
 Each parsed script is limited to 64 MB by default. Use `-MaxScriptSizeMB 128` for
@@ -331,7 +334,7 @@ limitations, including concurrent filesystem changes and large directory trees.
 Default exit codes: `0` both master-call checks pass and no reportable 0KB files
 are found; `1` any of these checks has findings;
 `2` the check is incomplete or failed. Allowed missing calls do not produce
-findings. The highest code wins for multiple releases. In detailed mode,
+findings. The highest code wins for multiple hotfixes. In detailed mode,
 nested missing targets, repetitions, and cycles can also produce `1`.
 
 ## Verification
@@ -341,7 +344,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\Test-Checker.ps1
 ```
 
 Tests cover parsing, direct versus indirect calls, exclusions, safe reports,
-matching CMD/TXT summaries, separate reports for multiple releases, error handling, and
+matching CMD/TXT summaries, separate reports for multiple hotfixes, error handling, and
 keeping the interactive window open. They also cover missing master targets,
 all 93 exception entries, exact filename matching, and independent results for
 the two checks, report naming/collisions, installer edits with encoding,
@@ -349,4 +352,4 @@ line-ending, and no-op preservation, and hook renames with case normalization,
 content preservation, and conflict handling. Further cases verify recursive
 zero-byte results, the four ignored extensions, and DOCX renames that preserve
 the installation instructions. See `tests\README.md`. Generated test
-reports stay under `tests\.work`, outside the fixture releases.
+reports stay under `tests\.work`, outside the fixture hotfixes.
